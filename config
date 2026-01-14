@@ -1,0 +1,8 @@
+[core]
+	repositoryformatversion = 0
+	filemode = false
+	bare = true
+	ignorecase = true
+[remote "origin"]
+	url = https://github.com/romain-o/NeuOpt_Project.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
