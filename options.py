@@ -31,6 +31,9 @@ def get_options(args=None):
     parser.add_argument('--wo_feature3', action='store_true')  # to remove ES featrues
     parser.add_argument('--wo_MDP', action='store_true', default=True) # always True (disabled function)
     
+    # DivideAndConquer configs
+    parser.add_argument('--dnc_n_splits', type=int, default=4, help='Number of splits for Divide-and-Conquer')
+    
     ### resume and load models
     parser.add_argument('--load_path', default = None, help='Path to load model parameters and optimizer state from')
     parser.add_argument('--resume', default = None, help='Resume from previous checkpoint file')

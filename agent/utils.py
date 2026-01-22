@@ -7,7 +7,7 @@ import numpy as np
 from utils.logger import log_to_screen, log_to_tb_val
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from tensorboard_logger import Logger as TbLogger
+from torch.utils.tensorboard import SummaryWriter
     
 def gather_tensor_and_concat(tensor):
     gather_t = [torch.ones_like(tensor) for _ in range(dist.get_world_size())]
@@ -38,7 +38,7 @@ def validate(rank, problem, agent, val_dataset, tb_logger, distributed = False, 
         agent.actor.to(device)
         agent.actor = torch.nn.parallel.DistributedDataParallel(agent.actor, device_ids=[rank])
         if not opts.no_tb and rank == 0:
-            tb_logger = TbLogger(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, 
+            tb_logger = SummaryWriter(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, 
                                                           opts.graph_size), opts.run_name))
         assert opts.val_batch_size % opts.world_size == 0
         train_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
