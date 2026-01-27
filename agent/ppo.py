@@ -221,6 +221,7 @@ class PPO:
             
 def train(rank, problem, agent, val_dataset, tb_logger):
     
+    
     opts = agent.opts
     warnings.filterwarnings("ignore")
     if opts.resume is None:

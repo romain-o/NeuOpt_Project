@@ -4,7 +4,7 @@ import torch
 import pprint
 import numpy as np
 import random
-from tensorboard_logger import Logger as TbLogger
+from torch.utils.tensorboard import SummaryWriter
 import warnings
 from options import get_options
 
@@ -34,7 +34,7 @@ def run(opts):
     # Optionally configure tensorboard
     tb_logger = None
     if not opts.no_tb and not opts.distributed:
-        tb_logger = TbLogger(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, 
+        tb_logger = SummaryWriter(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, 
                                                           opts.graph_size), opts.run_name))
     if not opts.no_saving and not os.path.exists(opts.save_dir):
         os.makedirs(opts.save_dir)

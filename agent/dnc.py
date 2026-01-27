@@ -3,6 +3,12 @@ from nets.actor_network import Actor
 from problems.problem_cvrp import CVRP
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from problems.problem_cvrp import total_history
+
+
+from utils import torch_load_cpu, get_inner_model, move_to
+
+feasibility_history_base = [True] * (total_history)
 
 class Divider():
     """Divides an instance in sub-instances
@@ -39,11 +45,11 @@ class Divider():
         sorted_real_demands = torch.gather(real_demands, 1, sorted_indices)
         
         sub_n_real = self.real_size // self.n_splits
-        sub_n_dummy = self.real_size // self.n_splits
+        sub_n_dummy = dummy_size // self.n_splits
         
-        split_real_coords = sorted_real_coords.view(bs * self.n_splits, sub_n_real, 2)
-        split_real_demands = sorted_real_demands.view(bs * self.n_splits, sub_n_real)
-        split_dummies_coords = dummies_coords.view(bs * self.n_splits, sub_n_dummy, 2)
+        split_real_coords = sorted_real_coords.reshape(bs * self.n_splits, sub_n_real, 2)
+        split_real_demands = sorted_real_demands.reshape(bs * self.n_splits, sub_n_real)
+        split_dummies_coords = dummies_coords.reshape(bs * self.n_splits, sub_n_dummy, 2)
         split_dummies_demands = torch.zeros(bs * self.n_splits, sub_n_dummy, device=coords.device)
         
         new_coords = torch.cat([split_dummies_coords, split_real_coords], dim=1)
@@ -52,45 +58,35 @@ class Divider():
         # Retrieve original indices
         global_indices_base = torch.arange(dummy_size, total_size, device=coords.device).expand(bs, -1)
         sorted_global_indices = torch.gather(global_indices_base, 1, sorted_indices)
-        split_global_indices = sorted_global_indices.view(bs * self.n_splits, sub_n_real)
+        split_global_indices = sorted_global_indices.reshape(bs * self.n_splits, sub_n_real)
         
         return {'coordinates': new_coords,
                 'demand': new_demands,
                 'original_indices': split_global_indices}
         
     def plot_subdivision(self, batch):
-        # 1. Récupération des données (CPU) pour le premier élément du batch
-        # On suppose que batch['coordinates'] est [B, N, 2]
+        """Visualisation de la division angulaire en K sous-problèmes"""
+        
         coords = batch['coordinates'][0].cpu() 
         dummy_size = self.problem.dummy_size
         
-        # 2. Séparation Dépôt / Clients
-        # Le premier dummy est considéré comme le dépôt principal pour le calcul d'angle
         depot = coords[0] 
         real_clients = coords[dummy_size:]
         
-        # 3. Réplication de la logique "Angular Sweep"
-        # On doit recalculer les angles ici car 'batch' contient les données brutes non triées
         rel_coords = real_clients - depot
         angles = torch.atan2(rel_coords[:, 1], rel_coords[:, 0])
         
-        # Tri des indices
         sorted_indices = torch.argsort(angles)
         
-        # On réordonne les clients selon l'angle pour visualiser les groupes contigus
         sorted_clients = real_clients[sorted_indices]
         
-        # 4. Affichage
         fig, ax = plt.subplots(figsize=(8, 8))
         
-        # Tracer le Dépôt
         ax.scatter(depot[0], depot[1], c='red', marker='s', s=200, label='Depot', zorder=10)
         
-        # Préparation des couleurs
         cmap = cm.get_cmap('tab10') if self.n_splits <= 10 else cm.get_cmap('rainbow')
         colors = [cmap(i / (self.n_splits - 1) if self.n_splits > 1 else 0) for i in range(self.n_splits)]
         
-        # Calcul de la taille de chaque sous-groupe (divisibilité déjà vérifiée dans __call__)
         chunk_size = len(real_clients) // self.n_splits
         
         print(f"--- Visualisation : {len(real_clients)} clients divisés en {self.n_splits} groupes de {chunk_size} ---")
@@ -131,15 +127,20 @@ class DNC():
     def __init__(self, problem, opts):
         self.opts = opts
         self.n_splits = opts.dnc_n_splits
-        self.subgraph_size = opts.graph_size // self.n_splits
+        self.real_sub_size = problem.real_size // self.n_splits
+        self.dummy_sub_size = problem.dummy_size // self.n_splits
+        self.total_sub_size = self.real_sub_size + self.dummy_sub_size
+        
         self.problem = problem
-        self.subproblem = CVRP(p_size = self.subgraph_size,
+        self.subproblem = CVRP(p_size = self.real_sub_size,
                                init_val_met = opts.init_val_met,
                                with_assert = opts.use_assert,
                                DUMMY_RATE = opts.dummy_rate,
                                k = opts.k,
                                with_bonus = not opts.wo_bonus,
                                with_regular = not opts.wo_regular)
+        
+        self.divider = Divider(problem = self.problem, opts = opts)
         
         self.actor = Actor(
             problem = self.subproblem,
@@ -149,12 +150,180 @@ class DNC():
             n_layers = opts.n_encode_layers,
             normalization = opts.normalization,
             v_range = opts.v_range,
-            seq_length = self.subgraph_size,
+            seq_length = self.total_sub_size,
             k = opts.k,
             with_RNN = not opts.wo_RNN,
             with_feature1 = not opts.wo_feature1,
             with_feature3 = not opts.wo_feature3,
             with_simpleMDP = opts.wo_MDP
+        ).to(opts.device)
+        
+    def rollout(self, T, val_m, stall_limit, batch, record=False, show_bar=False):
+        sub_batch_data = self.divider(batch)
+        active_problem = self.subproblem
+        batch = move_to(sub_batch_data, self.opts.device)
+        
+        bs, gs, _ = batch['coordinates'].size() #bs = batch_size * n_splits
+        
+        batch_aug_same = active_problem.augment(batch, val_m, only_copy=True)
+        batch_aug = active_problem.augment(batch, val_m)
+        batch_feature = active_problem.input_feature_encoding(batch_aug)
+        
+        solutions = move_to(active_problem.get_initial_solutions(batch_aug_same), self.opts.device)
+        solution_best = solutions.clone()
+        
+        obj, context = active_problem.get_costs(batch_aug_same, solutions, get_context=True, check_full_feasibility=True)
+        obj = torch.cat((obj[:,None], obj[:,None], obj[:,None]), -1).clone()
+        
+        context2 = torch.zeros(bs * val_m, 9).to(solutions.device)
+        context2[:, -1] = 1 # Initial state
+        
+        feasibility_history = torch.tensor(feasibility_history_base).view(-1, total_history).expand(bs * val_m, total_history).to(obj.device)
+        
+        solution_history = [solutions.clone()]
+        solution_best_history = [solution_best.clone()]
+        obj_history = [obj.clone()]        
+        feasible_history_recorded = [feasibility_history[:, 0]]
+        action = None
+        reward = []
+        stall_cnt_ins = torch.zeros(bs * val_m).to(solution_best.device)
+
+        # --- 3. PPO ITERATIONS LOOP ---
+        # Cette boucle est identique à l'originale, mais elle optimise les sous-tournées
+        iterator = range(T)
+        if show_bar and not self.opts.no_progress_bar:
+             from tqdm import tqdm
+             iterator = tqdm(iterator, desc='DNC rollout', bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}')
+
+        for t in iterator:       
+            
+            # Appel à l'acteur (sur le sous-problème)
+            action = self.actor(active_problem,
+                                batch_aug_same,
+                                batch_feature,
+                                solutions,
+                                context,
+                                context2,
+                                action)[0]
+
+            # Step de l'environnement
+            solutions, rewards, obj, feasibility_history, context, context2, info = active_problem.step(
+                batch_aug_same, 
+                solutions,
+                action,
+                obj,
+                feasibility_history,
+                t,
+                weights=0
+            )
+            
+            # Mise à jour de la meilleure solution trouvée
+            index = rewards[:, 0] > 0.0
+            solution_best[index] = solutions[index].clone()
+
+            # Enregistrement
+            reward.append(rewards[:, 0].clone())
+            obj_history.append(obj.clone())
+            
+            if record: 
+                solution_history.append(solutions.clone())
+                solution_best_history.append(solution_best.clone())
+                feasible_history_recorded.append(feasibility_history[:, 0].clone())
+            
+            # Gestion du "Stall" (Augmentation dynamique si on bloque)
+            if stall_limit > 0:
+                batch_aug_temp = active_problem.augment(batch, val_m)
+                stall_cnt_ins = stall_cnt_ins * (1 - index.float()) + 1
+                index_aug = stall_cnt_ins >= stall_limit
+                
+                # Attention : augmentation sur les coordonnées des sous-problèmes
+                batch_aug['coordinates'][index_aug] = batch_aug_temp['coordinates'][index_aug]
+                batch_feature = active_problem.input_feature_encoding(batch_aug)
+                stall_cnt_ins[index_aug] *= 0
+
+        # --- 4. OUTPUT ---
+        # Assertions (optionnelles mais recommandées en debug)
+        best_length = active_problem.get_costs(batch_aug_same, solution_best, get_context=False, check_full_feasibility=True)
+        # assert (best_length - obj[:,1] < 1e-5).all()
+
+        # Construction de la sortie standard
+        # Note : Ces métriques concernent les SOUS-PROBLÈMES.
+        # Pour l'entraînement, c'est ce qu'on veut (minimiser la somme des distances locales).
+        
+        out = (
+            obj[:, 1].reshape(bs, val_m).min(1)[0], # Best cost per sub-instance
+            torch.stack(obj_history, 1).view(bs, val_m, T + 1, -1).min(1)[0], # History
+            torch.stack(reward, 1).view(bs, val_m, T).max(1)[0], # Max reward
+            None if not record else (solution_history, solution_best_history, feasible_history_recorded)
         )
         
+        return out
     
+    def reconstruct(self, batch, sub_batch, rollout_output):
+        sub_costs_min = rollout_output[0]
+        records = rollout_output[3]
+        if records is None:
+            raise ValueError("Rollout must be called with record=True for reconstruction")
+        best_solutions_local = records[1][-1]
+        
+        bs = batch['coordinates'].size(0) # Batch Size original
+        K = self.n_splits
+   
+        sub_costs_matrix = sub_costs_min.view(bs, K)
+        total_cost = sub_costs_matrix.sum(dim=1)
+        
+        mapping_table = torch.zeros(
+            best_solutions_local.size(0), 
+            self.subproblem.size, 
+            dtype=torch.long, 
+            device=self.opts.device
+        )
+    
+        local_dummy_size = self.subproblem.dummy_size
+        
+        mapping_table[:, local_dummy_size:] = sub_batch['original_indices']
+    
+        reconstructed_routes_flat = torch.gather(mapping_table, 1, best_solutions_local.long())
+        
+        reconstructed_routes = reconstructed_routes_flat.view(bs, -1)
+        
+        return {
+            'total_cost': total_cost,          # Le coût total validé
+            'routes': reconstructed_routes,    # La séquence globale d'indices
+            'sub_costs': sub_costs_matrix      # Détail par secteur (pour debug)
+        }
+        
+    def load(self, load_path):
+        assert load_path is not None
+        print(f' [*] Loading data from {load_path}')
+        load_data = torch_load_cpu(load_path)
+        
+        # Chargement des poids du modèle (Actor / Critic)
+        model_actor = get_inner_model(self.actor)
+        model_actor.load_state_dict(load_data['actor'])
+        
+    def save(self, save_path):
+        torch.save(self.actor.state_dict(), save_path)
+        
+    def eval(self):
+        torch.set_grad_enabled(False)
+        self.actor.eval()
+        
+    def train(self):
+        torch.set_grad_enabled(True)
+        self.actor.train()
+        
+    def solve(self, batch, T, val_m=1, stall_limit=10):
+        self.eval()
+        with torch.no_grad():
+            rollout_output = self.rollout(
+                T = T,
+                val_m = val_m,
+                stall_limit = stall_limit,
+                batch = batch,
+                record = True,
+                show_bar = False
+            )
+            sub_batch = self.divider(batch)
+            result = self.reconstruct(batch, sub_batch, rollout_output)
+        return result
