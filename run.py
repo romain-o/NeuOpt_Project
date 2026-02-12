@@ -69,7 +69,7 @@ def run(opts):
     # Do validation only
     if opts.eval_only:
         # Load the validation datasets
-        agent.start_inference(problem, opts.val_dataset, tb_logger)
+        agent.start_inference(problem, tb_logger, val_dataset= opts.val_dataset)
         
     else:
         if opts.resume:

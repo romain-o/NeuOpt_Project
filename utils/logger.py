@@ -48,7 +48,7 @@ def log_to_tb_train(tb_logger, agent, Reward, ratios, bl_val_detached, total_cos
     tb_logger.add_scalar('train/weights', weights, mini_step)
     tb_logger.add_scalar('train/entropy', entropy.mean().item(), mini_step)
     tb_logger.add_scalar('train/approx_kl_divergence', approx_kl_divergence.item(), mini_step)
-    tb_logger.log_histogram('train/bl_val',bl_val_detached.cpu(),mini_step)
+    tb_logger.add_histogram('train/bl_val',bl_val_detached.cpu(),mini_step)
     tb_logger.add_scalar('loss/total_loss', (reinforce_loss+baseline_loss).item(), mini_step)
     tb_logger.add_scalar('loss/nll', -log_likelihood.mean().item(), mini_step)
     tb_logger.add_scalar('loss/actor_loss', reinforce_loss.item(), mini_step)

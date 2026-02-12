@@ -207,11 +207,11 @@ class PPO:
         
         return out
     
-    def start_inference(self, problem, val_dataset, tb_logger):
+    def start_inference(self, problem, tb_logger, val_dataset=None, input_batch=None):
         if self.opts.distributed:            
-            mp.spawn(validate, nprocs=self.opts.world_size, args=(problem, self, val_dataset, tb_logger, True))
+            mp.spawn(validate, nprocs=self.opts.world_size, args=(problem, self, tb_logger, val_dataset, True, None, input_batch))
         else:
-            validate(0, problem, self, val_dataset, tb_logger, distributed = False)
+            validate(0, problem, self, tb_logger , val_dataset=val_dataset, distributed = False, input_batch=input_batch)
             
     def start_training(self, problem, val_dataset, tb_logger):
         if self.opts.distributed:
@@ -330,7 +330,7 @@ def train(rank, problem, agent, val_dataset, tb_logger):
             
         
         # validate the new model   
-        if rank == 0: validate(rank, problem, agent, val_dataset, tb_logger, _id = epoch)
+        if rank == 0: validate(rank, problem, agent, tb_logger , val_dataset, _id = epoch)
         
         # syn
         if opts.distributed: dist.barrier()

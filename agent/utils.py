@@ -8,14 +8,16 @@ from utils.logger import log_to_screen, log_to_tb_val
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from problems.problem_cvrp import CVRPDataset
     
 def gather_tensor_and_concat(tensor):
     gather_t = [torch.ones_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(gather_t, tensor)
     return torch.cat(gather_t)
 
-def validate(rank, problem, agent, val_dataset, tb_logger, distributed = False, _id = None):
-            
+def validate(rank, problem, agent, tb_logger, val_dataset=None, distributed = False, _id = None, input_batch = None, conquer=False):
+    assert ((not val_dataset == None) or (not input_batch == None)), 'val_dataset or input_batch are both None'
+    
     # Validate mode
     opts = agent.opts
     if rank==0: print('\nValidating...', flush=True)
@@ -26,10 +28,12 @@ def validate(rank, problem, agent, val_dataset, tb_logger, distributed = False, 
         random.seed(opts.seed)
         np.random.seed(opts.seed)
     
-    val_dataset = problem.make_dataset(size=opts.graph_size,
-                               num_samples=opts.val_size,
-                               filename = val_dataset,
-                               DUMMY_RATE = opts.dummy_rate)
+    
+    if not isinstance(val_dataset, CVRPDataset):
+        val_dataset = problem.make_dataset(size=opts.graph_size,
+                            num_samples=opts.val_size,
+                            filename = val_dataset,
+                            DUMMY_RATE = opts.dummy_rate)
 
     if distributed and opts.distributed:
         device = torch.device("cuda", rank)
@@ -47,25 +51,49 @@ def validate(rank, problem, agent, val_dataset, tb_logger, distributed = False, 
                                     pin_memory=True,
                                     sampler=train_sampler)
     else:
-        val_dataloader = DataLoader(val_dataset, batch_size=opts.val_batch_size, shuffle=False,
-                                   num_workers=0,
-                                   pin_memory=True)
+        if val_dataset is not None:
+            val_dataloader = DataLoader(val_dataset, batch_size=opts.val_batch_size, shuffle=False,
+                                       num_workers=0,
+                                       pin_memory=True)
     
     s_time = time.time()
     bv = []
     obj_history = []
     r = []
-    for batch in tqdm(val_dataloader, desc = 'inference', bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}'):
-        bv_, obj_history_, r_, _ = agent.rollout(problem,
-                                               T = opts.T_max,
-                                               val_m = opts.val_m,
-                                               stall_limit = opts.stall_limit,
-                                               batch = batch,
-                                               record = opts.record,
-                                               show_bar = rank==0)
+    
+    should_record = opts.record or conquer
+    
+    def process_batch(batch_):
+        rollout_output = agent.rollout(problem=problem,
+                                        T=opts.T_max,
+                                        val_m=opts.val_m,
+                                        stall_limit=opts.stall_limit,
+                                        batch=batch_,
+                                        record=should_record,
+                                        show_bar=rank==0)
+        
+
+        if conquer:
+            sub_batch = rollout_output[-1]
+            res = agent.reconstruct(batch_, sub_batch, rollout_output)
+            bv_ = res['total_cost']
+            rollout_output = (bv_, rollout_output[1], rollout_output[2])
+            
+        return rollout_output[:3]
+    
+    if not input_batch is None:
+        print('Processing input batch')
+        bv_, obj_history_, r_ = process_batch(input_batch)
         bv.append(bv_)
         obj_history.append(obj_history_)
         r.append(r_)
+    else:
+        for batch in tqdm(val_dataloader, desc='inference', bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}'):
+            bv_, obj_history_, r_ = process_batch(batch)
+                    
+            bv.append(bv_)
+            obj_history.append(obj_history_)
+            r.append(r_)
         
     bv = torch.cat(bv, 0)
     obj_history = torch.cat(obj_history, 0)
@@ -89,14 +117,24 @@ def validate(rank, problem, agent, val_dataset, tb_logger, distributed = False, 
         reward = r
     
     # log to screen  
-    if rank == 0: log_to_screen(time_used, 
-                                  initial_cost, 
-                                  bv, 
-                                  reward, 
-                                  costs_history,
-                                  search_history,
-                                  batch_size = opts.val_size, 
-                                  T = opts.T_max)
+    if rank == 0: 
+        print(f"\n --- Results ({'CONQUER & RECONSTRUCT' if conquer else 'STANDARD'}) ---")
+        if conquer:
+            n_splits = opts.dnc_n_splits
+            initial_cost = initial_cost.view(-1, n_splits).sum(-1)
+            costs_history = costs_history.view(-1, n_splits, opts.T_max + 1).sum(1)
+            search_history = search_history.view(-1, n_splits, opts.T_max + 1).sum(1)
+            reward = reward.view(-1, n_splits, opts.T_max).sum(1)
+            
+        log_to_screen(time_used, 
+                                initial_cost, 
+                                bv, 
+                                reward, 
+                                costs_history,
+                                search_history,
+                                batch_size = opts.val_size, 
+                                T = opts.T_max)
+  
     
     # log to tb
     if(not opts.no_tb) and rank == 0:

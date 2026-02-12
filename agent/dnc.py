@@ -7,6 +7,7 @@ from problems.problem_cvrp import total_history
 
 
 from utils import torch_load_cpu, get_inner_model, move_to
+from agent.utils import validate
 
 feasibility_history_base = [True] * (total_history)
 
@@ -20,22 +21,21 @@ class Divider():
     
     def __call__(self, batch):
         dummy_size = self.problem.dummy_size
-        coords = batch['coordinates'] # [batch_size, graph_size+dummy_size, 2]
-        demands = batch['demand']   # [batch_size, graph_size+dummy_size]
+        coords = batch['coordinates'] if batch['coordinates'].dim() == 3 else batch['coordinates'].unsqueeze(0)  # [batch_size, graph_size+dummy_size, 2]
+        demands = batch['demand'] if batch['demand'].dim() == 2 else batch['demand'].unsqueeze(0)   # [batch_size, graph_size+dummy_size]
         
         bs, total_size, _ = coords.shape
         
         if self.problem.real_size % self.n_splits != 0:
             raise ValueError("Graph size must be divisible by number of splits")
         
-        dummies_coords = coords[:, :dummy_size, :]      # [B, dummy_size, 2]
+        depot_coords = coords[:, 0, :]                  # [B, 2]
         real_coords = coords[:, dummy_size:, :]         # [B, real_size, 2]
         real_demands = demands[:, dummy_size:]          # [B, real_size]
         
-        depot_ref = dummies_coords[:, 0, :].unsqueeze(1)
         
         #Relative coordinates for angular sweeping
-        rel_coords = real_coords - depot_ref
+        rel_coords = real_coords - depot_coords.unsqueeze(1)
         angles = torch.atan2(rel_coords[:, :, 1], rel_coords[:, :, 0]) # [B, real_size]
         
         sorted_indices = torch.argsort(angles, dim=1)
@@ -49,16 +49,27 @@ class Divider():
         
         split_real_coords = sorted_real_coords.reshape(bs * self.n_splits, sub_n_real, 2)
         split_real_demands = sorted_real_demands.reshape(bs * self.n_splits, sub_n_real)
-        split_dummies_coords = dummies_coords.reshape(bs * self.n_splits, sub_n_dummy, 2)
+        depot_repeated = depot_coords.repeat_interleave(self.n_splits, dim=0)
+        split_dummies_coords = depot_repeated.unsqueeze(1).expand(bs * self.n_splits, sub_n_dummy, 2).clone()
         split_dummies_demands = torch.zeros(bs * self.n_splits, sub_n_dummy, device=coords.device)
         
         new_coords = torch.cat([split_dummies_coords, split_real_coords], dim=1)
         new_demands = torch.cat([split_dummies_demands, split_real_demands], dim=1)
         
-        # Retrieve original indices
+        # 1. Indices des clients réels (Déjà présent)
+        # Ils vont de 'dummy_size' à 'total_size'
         global_indices_base = torch.arange(dummy_size, total_size, device=coords.device).expand(bs, -1)
         sorted_global_indices = torch.gather(global_indices_base, 1, sorted_indices)
-        split_global_indices = sorted_global_indices.reshape(bs * self.n_splits, sub_n_real)
+        split_real_indices = sorted_global_indices.reshape(bs * self.n_splits, sub_n_real)
+        
+        # 2. Indices des dummies (AJOUT)
+        # Les dummies générés correspondent au dépôt original (index 0).
+        # On assigne des ranges de dummies disjoints à chaque split pour permettre la reconstruction.
+        split_dummy_indices = torch.arange(0, self.n_splits * sub_n_dummy, device=coords.device).view(self.n_splits, sub_n_dummy).unsqueeze(0).expand(bs, -1, -1).reshape(bs * self.n_splits, sub_n_dummy)
+        
+        # 3. Concaténation pour avoir la structure [Dummies | Real]
+        # Shape finale : [bs * n_splits, sub_n_dummy + sub_n_real]
+        split_global_indices = torch.cat([split_dummy_indices, split_real_indices], dim=1)
         
         return {'coordinates': new_coords,
                 'demand': new_demands,
@@ -130,6 +141,7 @@ class DNC():
         self.real_sub_size = problem.real_size // self.n_splits
         self.dummy_sub_size = problem.dummy_size // self.n_splits
         self.total_sub_size = self.real_sub_size + self.dummy_sub_size
+        self.total_size = problem.real_size + problem.dummy_size
         
         self.problem = problem
         self.subproblem = CVRP(p_size = self.real_sub_size,
@@ -158,7 +170,8 @@ class DNC():
             with_simpleMDP = opts.wo_MDP
         ).to(opts.device)
         
-    def rollout(self, T, val_m, stall_limit, batch, record=False, show_bar=False):
+    def rollout(self, problem, T, val_m, stall_limit, batch, record=False, show_bar=False):
+        #l'argument problem sert juste pour que validate soit compatible avec DNC et PPO
         sub_batch_data = self.divider(batch)
         active_problem = self.subproblem
         batch = move_to(sub_batch_data, self.opts.device)
@@ -188,16 +201,13 @@ class DNC():
         reward = []
         stall_cnt_ins = torch.zeros(bs * val_m).to(solution_best.device)
 
-        # --- 3. PPO ITERATIONS LOOP ---
-        # Cette boucle est identique à l'originale, mais elle optimise les sous-tournées
         iterator = range(T)
         if show_bar and not self.opts.no_progress_bar:
              from tqdm import tqdm
              iterator = tqdm(iterator, desc='DNC rollout', bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}')
 
         for t in iterator:       
-            
-            # Appel à l'acteur (sur le sous-problème)
+
             action = self.actor(active_problem,
                                 batch_aug_same,
                                 batch_feature,
@@ -241,56 +251,151 @@ class DNC():
                 batch_feature = active_problem.input_feature_encoding(batch_aug)
                 stall_cnt_ins[index_aug] *= 0
 
-        # --- 4. OUTPUT ---
-        # Assertions (optionnelles mais recommandées en debug)
         best_length = active_problem.get_costs(batch_aug_same, solution_best, get_context=False, check_full_feasibility=True)
         # assert (best_length - obj[:,1] < 1e-5).all()
 
-        # Construction de la sortie standard
-        # Note : Ces métriques concernent les SOUS-PROBLÈMES.
-        # Pour l'entraînement, c'est ce qu'on veut (minimiser la somme des distances locales).
         
         out = (
             obj[:, 1].reshape(bs, val_m).min(1)[0], # Best cost per sub-instance
             torch.stack(obj_history, 1).view(bs, val_m, T + 1, -1).min(1)[0], # History
             torch.stack(reward, 1).view(bs, val_m, T).max(1)[0], # Max reward
-            None if not record else (solution_history, solution_best_history, feasible_history_recorded)
+            None if not record else (solution_history, solution_best_history, feasible_history_recorded),
+            sub_batch_data
         )
         
         return out
     
     def reconstruct(self, batch, sub_batch, rollout_output):
-        sub_costs_min = rollout_output[0]
+        # 1. Récupération des bruts (Raw Data)
         records = rollout_output[3]
         if records is None:
-            raise ValueError("Rollout must be called with record=True for reconstruction")
-        best_solutions_local = records[1][-1]
+            raise ValueError("Rollout must be called with record=True")
+            
+        # [BS * K * val_m, Sub_Size]
+        # Ce sont toutes les solutions de toutes les augmentations
+        best_solutions_aug = records[1][-1] 
         
-        bs = batch['coordinates'].size(0) # Batch Size original
-        K = self.n_splits
-   
-        sub_costs_matrix = sub_costs_min.view(bs, K)
-        total_cost = sub_costs_matrix.sum(dim=1)
+        # Dimensions
+        bs_real = batch['coordinates'].size(0) # Batch size original (ex: 10)
+        K = self.n_splits                      # Splits (ex: 4)
+        n_splits_total = bs_real * K           # Total sub-problems (ex: 40)
         
-        mapping_table = torch.zeros(
-            best_solutions_local.size(0), 
-            self.subproblem.size, 
-            dtype=torch.long, 
-            device=self.opts.device
-        )
-    
-        local_dummy_size = self.subproblem.dummy_size
+        # Détection automatique de val_m
+        total_rows = best_solutions_aug.size(0)
+        val_m = total_rows // n_splits_total
         
-        mapping_table[:, local_dummy_size:] = sub_batch['original_indices']
-    
-        reconstructed_routes_flat = torch.gather(mapping_table, 1, best_solutions_local.long())
+        # 2. Préparation pour la sélection du meilleur val_m
+        # On doit étendre les coordonnées/indices originaux pour matcher la taille augmentée
+        # sub_batch vient du divider, il est de taille [BS*K, ...]
         
-        reconstructed_routes = reconstructed_routes_flat.view(bs, -1)
+        # On étend les coordonnées pour recalculer le coût local exact
+        # [BS*K, N, 2] -> [BS*K*val_m, N, 2]
+        coords_sub = sub_batch['coordinates'].repeat_interleave(val_m, dim=0).to(self.opts.device)
+        
+        # On étend les indices originaux pour le mapping plus tard
+        # [BS*K, N] -> [BS*K*val_m, N]
+        original_indices_aug = sub_batch['original_indices'].repeat_interleave(val_m, dim=0).to(self.opts.device)
+        
+        # 3. Calcul des coûts pour départager les augmentations
+        # On recrée un mini-batch temporaire
+        temp_batch = {'coordinates': coords_sub}
+        if 'demand' in sub_batch:
+            temp_batch['demand'] = sub_batch['demand'].repeat_interleave(val_m, dim=0).to(self.opts.device)
+            
+        # Calcul du coût de chaque variation
+        costs_aug = self.subproblem.get_costs(temp_batch, best_solutions_aug) # [BS*K*val_m]
+        
+        # 4. Sélection des Vainqueurs (Best Augmentation)
+        # On reshape pour isoler la dimension val_m : [BS*K, val_m]
+        costs_view = costs_aug.view(n_splits_total, val_m)
+        
+        # On trouve l'index de la meilleure augmentation pour chaque sous-problème
+        min_vals, min_idxs = torch.min(costs_view, dim=1) # [BS*K]
+        
+        # On sélectionne les routes et indices gagnants
+        # Astuce : on utilise gather ou l'indexation avancée
+        # On veut extraire les lignes correspondantes dans les tenseurs augmentés
+        
+        # Index global dans le tenseur "aug" correspondant au meilleur val_m
+        # Ex: Si le split 0 a gagné avec l'aug 3, l'index est 0*val_m + 3
+        selection_indices = torch.arange(n_splits_total, device=self.opts.device) * val_m + min_idxs
+        
+        # [BS*K, Sub_Size] -> On a maintenant UNE solution par split (la meilleure)
+        best_sols = best_solutions_aug[selection_indices]
+        real_indices = original_indices_aug[selection_indices]
+        
+        # 5. Reconstruction Vectorisée (Mapping Global)
+        
+        # Reshape pour séparer Batch et Splits : [BS, K, Sub_Size]
+        sols_view = best_sols.view(bs_real, K, -1)
+        inds_view = real_indices.view(bs_real, K, -1)
+        
+        # Initialisation Routes Globales
+        reconstructed_routes = torch.zeros((bs_real, self.total_size), dtype=torch.long, device=self.opts.device)
+        
+        # A. Mapping Local -> Global
+        # mapped_sols[b, k, i] = Index global pointé par le nœud i du split k du batch b
+        mapped_sols = torch.gather(inds_view, 2, sols_view)
+        
+        # On écrit tout dans la table globale (sauf les dummies, écrasés sans risque car distincts)
+        flat_inds = inds_view.flatten(1)       # [BS, K*Sub_Size]
+        flat_vals = mapped_sols.flatten(1)     # [BS, K*Sub_Size]
+        reconstructed_routes.scatter_(1, flat_inds, flat_vals)
+        
+        # 6. Couture (Daisy Chain) - C'est ici qu'on relie les splits
+        # Rappel : Chaque split k a ses PROPRES dummies.
+        # Le Split k va de Start_k ... à End_k.
+        # End_k pointe naturellement vers son dummy (Dummy_k).
+        # On veut changer ça : End_k doit pointer vers le dummy du split suivant (Dummy_{k+1}).
+        
+        # Identifier le Dummy du Split k (C'est toujours l'index 0 local)
+        # global_dummies[b, k] = Index global du dummy du split k
+        global_dummies = inds_view[:, :, 0] 
+        
+        # Identifier le nœud de FIN du Split k (Celui qui pointe vers 0 localement)
+        # Correction : On filtre pour ne prendre que les nœuds réellement visités qui pointent vers 0
+        # (Sinon on risque de prendre un nœud inutilisé qui pointe vers 0 par défaut, brisant la boucle)
+        visited_times = self.subproblem.get_order(best_sols, return_solution=False) # [BS*K, Sub_Size]
+        visited_times_view = visited_times.view(bs_real, K, -1)
+        
+        valid_exits = (sols_view == 0) & (visited_times_view > 0)
+        
+        local_end_indices = valid_exits.float().argmax(dim=2) # [BS, K]
+        # local_end_indices = (sols_view == 0).float().argmax(dim=2) # [BS, K] (OLD)
+
+        # Convertir en index global (Source du lien à modifier)
+        global_ends = torch.gather(inds_view, 2, local_end_indices.unsqueeze(2)).squeeze(2) # [BS, K]
+        
+        # Connexions :
+        # Split 0 -> Split 1 -> ... -> Split K-1 -> Split 0 (ou Dépôt Global)
+        
+        # Sources : Les fins des splits 0 à K-2
+        sources = global_ends[:, :-1] # [BS, K-1]
+        # Cibles : Les dummies des splits 1 à K-1
+        targets = global_dummies[:, 1:] # [BS, K-1]
+        
+        # Appliquer la redirection
+        reconstructed_routes.scatter_(1, sources, targets)
+        
+        # Cas spécial : Le dernier split doit pointer vers le tout premier dummy (le vrai dépôt global)
+        # Si Dummy_0 est le dépôt global, on pointe vers global_dummies[:, 0]
+        last_source = global_ends[:, -1].unsqueeze(1)
+        first_dummy = global_dummies[:, 0].unsqueeze(1)
+        reconstructed_routes.scatter_(1, last_source, first_dummy)
+
+        # 7. Finalisation
+        # Coût total = Somme des coûts MINIMAUX trouvés à l'étape 4
+        # min_vals est [BS*K], on reshape en [BS, K] et on somme
+        total_cost = min_vals.view(bs_real, K).sum(dim=1)
+        
+        # Ordonner pour l'affichage (optionnel, mais propre)
+        rec_ordered = self.problem.get_order(reconstructed_routes, True)
         
         return {
-            'total_cost': total_cost,          # Le coût total validé
-            'routes': reconstructed_routes,    # La séquence globale d'indices
-            'sub_costs': sub_costs_matrix      # Détail par secteur (pour debug)
+            'total_cost': total_cost,
+            'routes': rec_ordered,
+            'sub_costs': min_vals.view(bs_real, K),
+            'pre_manip' : reconstructed_routes
         }
         
     def load(self, load_path):
@@ -313,17 +418,21 @@ class DNC():
         torch.set_grad_enabled(True)
         self.actor.train()
         
-    def solve(self, batch, T, val_m=1, stall_limit=10):
+    def solve(self, batch, T, val_m=1, stall_limit=10, show_bar=False):
         self.eval()
         with torch.no_grad():
             rollout_output = self.rollout(
+                problem=self.problem,
                 T = T,
                 val_m = val_m,
                 stall_limit = stall_limit,
                 batch = batch,
                 record = True,
-                show_bar = False
+                show_bar = show_bar
             )
             sub_batch = self.divider(batch)
             result = self.reconstruct(batch, sub_batch, rollout_output)
-        return result
+        return result, rollout_output
+    
+    def start_inference(self, problem, tb_logger, val_dataset=None, input_batch=None, conquer=False):
+        validate(0, problem, self, tb_logger , val_dataset=val_dataset, distributed = False, input_batch=input_batch, conquer=conquer)

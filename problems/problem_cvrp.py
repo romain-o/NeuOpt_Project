@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 import torch
 import pickle
 import os
@@ -377,31 +377,60 @@ class CVRP(object):
 
 
 class CVRPDataset(Dataset):
-    def __init__(self, filename=None, size=20, num_samples=10000, offset=0, distribution=None, DUMMY_RATE = None, CVRPLib_paths=None):
+    def __init__(self, filename=None, size=20, num_samples=10000, offset=0, distribution=None, DUMMY_RATE = 0.5, CVRPLib_paths=None, scale_factor=1000):
         
         super(CVRPDataset, self).__init__()
         
         self.data = []
         self.size = int(np.ceil(size * (1 + DUMMY_RATE))) # the number of real nodes plus dummy nodes in cvrp
         self.real_size = size # the number of real nodes in cvrp
-
+        self.scale_factor = scale_factor
+        
         if filename is not None:
             assert os.path.splitext(filename)[1] == '.pkl', 'file name error'
             
+            print(f"Loading data from {filename}...")
             with open(filename, 'rb') as f:
                 data = pickle.load(f)
-            self.data = [self.make_instance(args) for args in data[offset:offset+num_samples]]
+            
+            # Application de l'offset et de la limite num_samples
+            # On gère le cas où le fichier contient moins de données que demandé
+            end = min(len(data), offset + num_samples)
+            data_slice = data[offset:end]
+
+            if len(data_slice) > 0:
+                # DÉTECTION AUTOMATIQUE DU FORMAT
+                first_item = data_slice[0]
+
+                if isinstance(first_item, dict):
+                    # CAS A : Le dataset est déjà traité (liste de dicts {'coordinates', 'demand'})
+                    # C'est le cas si vous avez fait pickle.dump(dataset .data, f)
+                    self.data = data_slice
+                    print(f" -> Format détecté : Dictionnaires traités. Chargé {len(self.data)} instances.")
+                    
+                    # Optionnel : Vérification de la cohérence des tailles
+                    if self.data[0]['coordinates'].size(0) != self.size:
+                        print(f"Warning: Loaded data size ({self.data[0]['coordinates'].size(0)}) does not match requested size ({self.size}). Updating self.size.")
+                        self.size = self.data[0]['coordinates'].size(0)
+                        self.real_size = self.size - int(self.size * (DUMMY_RATE / (1+DUMMY_RATE))) # Approximation inverse
+                
+                else:
+                    # CAS B : Le dataset est brut (liste de tuples/listes [depot, loc, ...])
+                    # C'est le format standard des datasets de validation NeuOpt/POMO
+                    self.data = [self.make_instance(args) for args in data_slice]
+                    print(f" -> Format détecté : Données brutes. Converti {len(self.data)} instances.")
+            else:
+                self.data = []
+                print("Warning: No data loaded (check offset/num_samples).")
 
         elif CVRPLib_paths is not None:
 
             for instance_path in CVRPLib_paths:
                 instance = vrplib.read_instance(instance_path)
                 
-                def min_max_norm(coords):
-                    return (coords - coords.min()) / (coords.max() - coords.min() + 1e-8)
                 
                 capacity = instance['capacity']
-                norm_coords = min_max_norm(torch.from_numpy(instance['node_coord']).float())
+                norm_coords = torch.from_numpy(instance['node_coord']).float() / self.scale_factor
                 norm_demand = torch.from_numpy(instance['demand']).float() / capacity
                 
                 depot_coord = norm_coords[0]        # [x, y]
@@ -422,6 +451,13 @@ class CVRPDataset(Dataset):
                     'demand': full_demand
                 })
 
+        elif distribution == 'centered':
+            self.data = [{'coordinates': torch.cat((torch.full((self.size - self.real_size, 2), 0.5), 
+                                                    torch.FloatTensor(self.real_size, 2).uniform_(0, 1)), 0),
+                          'demand': torch.cat((torch.zeros(self.size - self.real_size),
+                                               torch.FloatTensor(self.real_size).uniform_(1, 10).long() / get_capacity(self.real_size)), 0)
+                          } for i in range(num_samples)]
+            
         else:            
             self.data = [{'coordinates': torch.cat((torch.FloatTensor(1, 2).uniform_(0, 1).repeat(self.size - self.real_size,1), 
                                                     torch.FloatTensor(self.real_size, 2).uniform_(0, 1)), 0),
@@ -447,3 +483,194 @@ class CVRPDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+    
+    def divide(self, divider):
+        """
+        Applique le divider à chaque instance du dataset et met à jour self.data avec les instances divisées.
+        """
+        new_data = []
+        for instance in self.data:
+            divided_instances = divider(instance)
+            n_splits = divided_instances['coordinates'].size(0)
+            for i in range(n_splits):
+                sub_instance = {
+                    key: tensor[i].clone() 
+                    for key, tensor in divided_instances.items()
+                }
+                new_data.append(sub_instance)
+        
+        self.data = new_data
+        self.N = len(self.data)
+        if self.N > 0:
+            self.size = self.data[0]['coordinates'].size(0)
+            self.real_size = self.real_size // n_splits
+        print(f'{self.N} instances after division.')
+        
+    
+class SubCVRPDataset(Dataset):
+    def __init__(self, problem, divider):
+        """
+        data_list: Liste de dictionnaires {'coordinates': tensor, 'demand': tensor}
+        """
+        super(SubCVRPDataset, self).__init__()
+        self.data = []
+        self.N = len(self.data)
+        self.problem = problem
+        self.divider = divider
+        self.bs = 16
+        print(f'{self.N} instances modifiées chargées.')
+
+    def __len__(self):
+        return self.N
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+    
+    def save(self, filename):
+        output_dir = 'my_datasets'
+        os.makedirs(output_dir, exist_ok=True)
+        if not filename.endswith('.pkl'):
+            filename += '.pkl'
+        filepath = os.path.join(output_dir, filename)
+        
+        try:
+            with open(filepath, 'wb') as f:
+                pickle.dump(self.data, f)
+            print(f"Dataset saved : {filepath}")
+            print(f"   Contains {len(self.data)} instances.")
+        except Exception as e:
+            print(f"Error saving dataset: {e}")
+            
+    def generate_centered_instances(self, num_samples):
+        """
+        Génère des instances synthétiques avec le dépôt AU CENTRE (0.5, 0.5).
+        
+        Args:
+            num_samples (int): Nombre d'instances à générer
+            size (int): Taille totale (Padding + Clients)
+            real_size (int): Nombre réel de clients
+            
+        Attribue a self.data une liste de dictionnaires {'coordinates': tensor, 'demand': tensor} après application du divider.
+        Génère num_samples*self.divider.n_split instances au total après le split.
+    
+        """
+        
+        # 1. Calcul des dimensions
+        n_padding = self.problem.size - self.problem.real_size  # Nombre de dummies (incluant le dépôt principal)
+        cap = get_capacity(self.problem.real_size)
+        
+        client_locs = torch.FloatTensor(num_samples, self.problem.real_size, 2).uniform_(0, 1)
+        padding_locs = torch.full((num_samples, n_padding, 2), 0.5)
+        
+        all_locs = torch.cat((padding_locs, client_locs), dim=1)
+        
+        # 3. Génération de la demande
+        # A. Padding : Demande 0
+        padding_demands = torch.zeros(num_samples, n_padding)
+        
+        # B. Clients : Uniforme Entier [1, 9], normalisé par la capacité
+        # Shape: [num_samples, real_size]
+        client_demands = torch.FloatTensor(num_samples, self.problem.real_size).uniform_(0, 1)
+        
+        # C. Concaténation
+        all_demands = torch.cat((padding_demands, client_demands), dim=1)
+        
+        # 4. Conversion en liste de dictionnaires (Dé-batching pour stockage propre)
+        temp_dataset = TensorDataset(all_locs, all_demands)
+        loader = DataLoader(temp_dataset, batch_size=self.bs, shuffle=False)
+        
+        final_data_list = []
+        
+        print(f"--- Application du split et formatage (Batch size: {self.bs}) ---")
+        
+        for batch_locs, batch_dems in loader:
+            # Création du dictionnaire attendu par votre fonction de split
+            # batch_locs: [B, Size, 2], batch_dems: [B, Size]
+            current_batch = {'coordinates': batch_locs, 'demand': batch_dems}
+            
+            # Application du split (si une fonction est fournie)
+            if self.divider is not None:
+                # La fonction split renvoie un nouveau dictionnaire avec des tenseurs plus gros (ou plus nombreux)
+                processed_batch = self.divider(current_batch)
+            else:
+                processed_batch = current_batch
+
+            # Extraction des résultats
+            proc_locs = processed_batch['coordinates'] # [New_B, New_Size, 2]
+            proc_dems = processed_batch['demand']      # [New_B, New_Size]
+            
+            # --- ETAPE 3 : Dé-batching (Mise en liste) ---
+            # On itère sur la dimension 0 du batch traité
+            current_batch_count = proc_locs.size(0)
+            
+            for i in range(current_batch_count):
+                final_data_list.append({
+                    'coordinates': proc_locs[i].clone(), # Clone pour détacher de la mémoire du batch
+                    'demand': proc_dems[i].clone()
+                })
+
+        print(f"✨ Terminé. Nombre final d'instances : {len(final_data_list)}")
+        self.data = final_data_list
+        self.N = len(self.data)
+        print(f'{self.N} instances modifiées chargées.')
+        
+    def plot_instance(self, idx, show_demands=True, title=None):
+        """
+        Affiche l'instance à l'index donné.
+        
+        Args:
+            idx (int): L'index de l'instance dans le dataset.
+            show_demands (bool): Si True, affiche la demande à côté de chaque nœud.
+            title (str): Titre optionnel du graphique.
+        """
+        import matplotlib.pyplot as plt
+
+        # 1. Récupération des données (et passage sur CPU / Numpy)
+        instance = self.data[idx]
+        coords = instance['coordinates']
+        demands = instance['demand']
+
+        if torch.is_tensor(coords):
+            coords = coords.cpu().numpy()
+            demands = demands.cpu().numpy()
+
+        # Séparation Dépôt (index 0) et Clients (index 1 à la fin)
+        # Note : Si vous avez des dummies au même endroit que le dépôt, ils seront superposés
+        depot = coords[0]
+        clients = coords[1:]
+
+        # 2. Configuration du Plot
+        plt.figure(figsize=(8, 8))
+        
+        # Tracer le Dépôt (Carré Rouge)
+        plt.scatter(depot[0], depot[1], c='red', marker='s', s=100, label='Dépôt', zorder=10)
+        
+        # Tracer les Clients (Ronds Bleus)
+        plt.scatter(clients[:, 0], clients[:, 1], c='blue', s=50, alpha=0.6, label='Clients')
+
+        # 3. Annotations (Demandes)
+        if show_demands:
+            # Pour le dépôt (souvent demande 0, on l'affiche quand même ou non)
+            plt.text(depot[0]+0.02, depot[1]+0.02, f"D: {demands[0]:.2f}", fontsize=9, color='red')
+            
+            # Pour les clients
+            for i, (x, y) in enumerate(clients):
+                # i+1 car on a sauté le dépôt dans la liste 'clients'
+                d = demands[i+1]
+                if d > 0: # On n'affiche que si la demande est positive (pour éviter de surcharger avec les dummies)
+                    plt.text(x+0.01, y+0.01, f"{d:.2f}", fontsize=9)
+
+        # 4. Mise en forme
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.legend(loc='upper right')
+        
+        if title:
+            plt.title(title)
+        else:
+            plt.title(f"Instance #{idx} (N={len(coords)})")
+            
+        plt.xlabel("Coordonnée X")
+        plt.ylabel("Coordonnée Y")
+        plt.show()
