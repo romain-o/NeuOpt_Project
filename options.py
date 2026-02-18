@@ -52,6 +52,7 @@ def get_options(args=None):
     parser.add_argument('--val_dataset', type=str, default = None, help='Dataset file to use for validation')
     parser.add_argument('--lr_model', type=float, default=8e-5, help="Set the learning rate for the actor network")
     parser.add_argument('--lr_critic', type=float, default=2e-5, help="Set the learning rate for the critic network")
+    parser.add_argument('--lr_divider', type=float, default=1e-4, help="Set the learning rate for the divider network")
     parser.add_argument('--lr_decay', type=float, default=0.985, help='Learning rate decay per epoch')
     parser.add_argument('--warm_up', type=float, default=2) # the rho in the paper
     parser.add_argument('--max_grad_norm', type=float, default=0.05, help='Maximum L2 norm for gradient clipping, default 1.0 (0 to disable clipping)')

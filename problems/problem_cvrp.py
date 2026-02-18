@@ -506,6 +506,21 @@ class CVRPDataset(Dataset):
             self.real_size = self.real_size // n_splits
         print(f'{self.N} instances after division.')
         
+    def save(self, filename):
+        output_dir = 'my_datasets'
+        os.makedirs(output_dir, exist_ok=True)
+        if not filename.endswith('.pkl'):
+            filename += '.pkl'
+        filepath = os.path.join(output_dir, filename)
+        
+        try:
+            with open(filepath, 'wb') as f:
+                pickle.dump(self.data, f)
+            print(f"Dataset saved : {filepath}")
+            print(f"   Contains {len(self.data)} instances.")
+        except Exception as e:
+            print(f"Error saving dataset: {e}")
+        
     
 class SubCVRPDataset(Dataset):
     def __init__(self, problem, divider):

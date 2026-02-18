@@ -1,5 +1,6 @@
 import torch
 from nets.actor_network import Actor
+from nets.divider_net import NeuralDivider
 from problems.problem_cvrp import CVRP
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -18,6 +19,9 @@ class Divider():
         self.problem = problem
         self.n_splits = opts.dnc_n_splits
         self.real_size = problem.real_size
+    
+    def make_sub_batch(self, batch):
+        return self(batch)
     
     def __call__(self, batch):
         dummy_size = self.problem.dummy_size
@@ -71,9 +75,32 @@ class Divider():
         # Shape finale : [bs * n_splits, sub_n_dummy + sub_n_real]
         split_global_indices = torch.cat([split_dummy_indices, split_real_indices], dim=1)
         
+        new_coords, norm_factor = self.normalize(new_coords)
+        
         return {'coordinates': new_coords,
                 'demand': new_demands,
-                'original_indices': split_global_indices}
+                'original_indices': split_global_indices,
+                'norm_factor': norm_factor}
+        
+    def normalize(self, coords):
+        """
+        Normalise les coordonnées dans [0, 1].
+        Retourne les coordonnées normalisées et le facteur d'échelle.
+        """
+        min_vals, _ = coords.min(dim=1, keepdim=True) # [BS*K, 1, 2]
+        max_vals, _ = coords.max(dim=1, keepdim=True) # [BS*K, 1, 2]
+        
+        # 2. Calculer la largeur et la hauteur
+        ranges = max_vals - min_vals # [BS*K, 1, 2] (width, height)
+        
+        # On prend le max du range selon x ou y.
+        scale, _ = ranges.max(dim=2, keepdim=True) # [BS*K, 1, 1]
+        # Eviter de diviser par 0
+        scale = torch.clamp(scale, min=1e-8)
+    
+        normalized_coords = (coords - min_vals) / scale
+    
+        return normalized_coords, scale
         
     def plot_subdivision(self, batch):
         """Visualisation de la division angulaire en K sous-problèmes"""
@@ -135,7 +162,7 @@ class Divider():
 class DNC():
     """Divide and conquer agent inspired by NeuOpt
     """
-    def __init__(self, problem, opts):
+    def __init__(self, problem, opts, divider):
         self.opts = opts
         self.n_splits = opts.dnc_n_splits
         self.real_sub_size = problem.real_size // self.n_splits
@@ -152,7 +179,7 @@ class DNC():
                                with_bonus = not opts.wo_bonus,
                                with_regular = not opts.wo_regular)
         
-        self.divider = Divider(problem = self.problem, opts = opts)
+        self.divider = divider
         
         self.actor = Actor(
             problem = self.subproblem,
@@ -171,13 +198,30 @@ class DNC():
         ).to(opts.device)
         
     def rollout(self, problem, T, val_m, stall_limit, batch, record=False, show_bar=False):
-        #l'argument problem sert juste pour que validate soit compatible avec DNC et PPO
-        sub_batch_data = self.divider(batch)
+
+        if 'norm_factor' in batch:
+            sub_batch_data = batch
+        else:
+            if hasattr(self, 'divider') and isinstance(self.divider, NeuralDivider):
+                with torch.no_grad():
+                     assignments, _, _ = self.divider(batch, greedy=True)
+                sub_batch_data = self.divider.make_sub_batch(batch, assignments)
+            else:
+                sub_batch_data = self.divider.make_sub_batch(batch)
+   
+            
+        
+        
+        # On récupère le scale [BS, 1, 1] ou [BS]
+        # On le sécurise au cas où le divider ne le renvoie pas (compatibilité)
+        norm_factor = sub_batch_data.get('norm_factor', None)
+        
         active_problem = self.subproblem
-        batch = move_to(sub_batch_data, self.opts.device)
+        batch = move_to(sub_batch_data, self.opts.device) # [BS*K, N, 2], [BS*K, N], [BS*K, N], [BS*K, 1, 1], coordonnées, demandes, indices, norm_factor
         
-        bs, gs, _ = batch['coordinates'].size() #bs = batch_size * n_splits
+        bs, gs, _ = batch['coordinates'].size() # bs ici est déjà (Batch_Size * n_splits)
         
+        # 2. Augmentations (Data Augmentation)
         batch_aug_same = active_problem.augment(batch, val_m, only_copy=True)
         batch_aug = active_problem.augment(batch, val_m)
         batch_feature = active_problem.input_feature_encoding(batch_aug)
@@ -185,11 +229,12 @@ class DNC():
         solutions = move_to(active_problem.get_initial_solutions(batch_aug_same), self.opts.device)
         solution_best = solutions.clone()
         
+        # Calcul du coût initial (C'est un coût NORMALISÉ ici, entre 0 et ~1.4)
         obj, context = active_problem.get_costs(batch_aug_same, solutions, get_context=True, check_full_feasibility=True)
         obj = torch.cat((obj[:,None], obj[:,None], obj[:,None]), -1).clone()
         
         context2 = torch.zeros(bs * val_m, 9).to(solutions.device)
-        context2[:, -1] = 1 # Initial state
+        context2[:, -1] = 1 
         
         feasibility_history = torch.tensor(feasibility_history_base).view(-1, total_history).expand(bs * val_m, total_history).to(obj.device)
         
@@ -206,8 +251,8 @@ class DNC():
              from tqdm import tqdm
              iterator = tqdm(iterator, desc='DNC rollout', bar_format='{l_bar}{bar:20}{r_bar}{bar:-20b}')
 
+        # 3. Boucle d'Optimisation (Travaille sur les données NORMALISÉES)
         for t in iterator:       
-
             action = self.actor(active_problem,
                                 batch_aug_same,
                                 batch_feature,
@@ -216,7 +261,6 @@ class DNC():
                                 context2,
                                 action)[0]
 
-            # Step de l'environnement
             solutions, rewards, obj, feasibility_history, context, context2, info = active_problem.step(
                 batch_aug_same, 
                 solutions,
@@ -227,11 +271,9 @@ class DNC():
                 weights=0
             )
             
-            # Mise à jour de la meilleure solution trouvée
             index = rewards[:, 0] > 0.0
             solution_best[index] = solutions[index].clone()
 
-            # Enregistrement
             reward.append(rewards[:, 0].clone())
             obj_history.append(obj.clone())
             
@@ -240,161 +282,119 @@ class DNC():
                 solution_best_history.append(solution_best.clone())
                 feasible_history_recorded.append(feasibility_history[:, 0].clone())
             
-            # Gestion du "Stall" (Augmentation dynamique si on bloque)
             if stall_limit > 0:
                 batch_aug_temp = active_problem.augment(batch, val_m)
                 stall_cnt_ins = stall_cnt_ins * (1 - index.float()) + 1
                 index_aug = stall_cnt_ins >= stall_limit
                 
-                # Attention : augmentation sur les coordonnées des sous-problèmes
                 batch_aug['coordinates'][index_aug] = batch_aug_temp['coordinates'][index_aug]
                 batch_feature = active_problem.input_feature_encoding(batch_aug)
                 stall_cnt_ins[index_aug] *= 0
 
-        best_length = active_problem.get_costs(batch_aug_same, solution_best, get_context=False, check_full_feasibility=True)
-        # assert (best_length - obj[:,1] < 1e-5).all()
+        # 4. PRÉPARATION DU SCALING (Le Zoom Inverse)
+        # On applique le facteur d'échelle MAINTENANT, avant de renvoyer les résultats.
+        
+        if norm_factor is not None:
+            # norm_factor est [bs, 1, 1]. On veut un vecteur [bs * val_m]
+            scale = norm_factor.to(obj.device).view(-1) # [bs]
+            scale = scale.repeat_interleave(val_m, dim=0) # [bs * val_m]
+            
+            # Facteurs de forme pour le broadcasting
+            scale_obj = scale # [bs * val_m]
+            scale_hist = scale.view(-1, 1, 1) # [bs * val_m, 1, 1]
+            scale_rew = scale.view(-1, 1) # [bs * val_m, 1]
+        else:
+            # Fallback si pas de normalisation
+            scale_obj = 1.0
+            scale_hist = 1.0
+            scale_rew = 1.0
 
+        # 5. RETOUR (Avec application du scaling)
+        # On multiplie les coûts normalisés par le scale pour obtenir les coûts réels.
         
         out = (
-            obj[:, 1].reshape(bs, val_m).min(1)[0], # Best cost per sub-instance
-            torch.stack(obj_history, 1).view(bs, val_m, T + 1, -1).min(1)[0], # History
-            torch.stack(reward, 1).view(bs, val_m, T).max(1)[0], # Max reward
+            (obj[:, 1] * scale_obj).reshape(bs, val_m).min(1)[0], # Best cost REEL per sub-instance
+            (torch.stack(obj_history, 1) * scale_hist).view(bs, val_m, T + 1, -1).min(1)[0], # History REEL
+            (torch.stack(reward, 1) * scale_rew).view(bs, val_m, T).max(1)[0], # Max reward REEL
             None if not record else (solution_history, solution_best_history, feasible_history_recorded),
             sub_batch_data
         )
         
         return out
     
-    def reconstruct(self, batch, sub_batch, rollout_output):
-        # 1. Récupération des bruts (Raw Data)
+    def reconstruct(self, batch, rollout_output):
         records = rollout_output[3]
+        sub_batch = rollout_output[4]
         if records is None:
             raise ValueError("Rollout must be called with record=True")
             
-        # [BS * K * val_m, Sub_Size]
-        # Ce sont toutes les solutions de toutes les augmentations
-        best_solutions_aug = records[1][-1] 
+        best_solutions_aug = records[1][-1] # [BS * K * val_m, Sub_Size]
         
         # Dimensions
-        bs_real = batch['coordinates'].size(0) # Batch size original (ex: 10)
-        K = self.n_splits                      # Splits (ex: 4)
-        n_splits_total = bs_real * K           # Total sub-problems (ex: 40)
+        bs_real = batch['coordinates'].size(0)
+        K = self.n_splits
+        n_splits_total = bs_real * K
+        val_m = best_solutions_aug.size(0) // n_splits_total
         
-        # Détection automatique de val_m
-        total_rows = best_solutions_aug.size(0)
-        val_m = total_rows // n_splits_total
-        
-        # 2. Préparation pour la sélection du meilleur val_m
-        # On doit étendre les coordonnées/indices originaux pour matcher la taille augmentée
-        # sub_batch vient du divider, il est de taille [BS*K, ...]
-        
-        # On étend les coordonnées pour recalculer le coût local exact
+        # 1. Préparation Données Augmentées
         # [BS*K, N, 2] -> [BS*K*val_m, N, 2]
         coords_sub = sub_batch['coordinates'].repeat_interleave(val_m, dim=0).to(self.opts.device)
-        
-        # On étend les indices originaux pour le mapping plus tard
-        # [BS*K, N] -> [BS*K*val_m, N]
         original_indices_aug = sub_batch['original_indices'].repeat_interleave(val_m, dim=0).to(self.opts.device)
         
-        # 3. Calcul des coûts pour départager les augmentations
-        # On recrée un mini-batch temporaire
+        # Gestion du Facteur de Normalisation (Important pour le coût réel)
+        # norm_factor est [BS*K, 1, 1], on l'étend aussi
+        norm_factor = sub_batch['norm_factor'].repeat_interleave(val_m, dim=0).view(-1).to(self.opts.device)
+
+        # 2. Calcul des Coûts Normalisés (pour départager les augmentations)
         temp_batch = {'coordinates': coords_sub}
         if 'demand' in sub_batch:
             temp_batch['demand'] = sub_batch['demand'].repeat_interleave(val_m, dim=0).to(self.opts.device)
             
-        # Calcul du coût de chaque variation
-        costs_aug = self.subproblem.get_costs(temp_batch, best_solutions_aug) # [BS*K*val_m]
+        # Coûts dans l'espace [0, 1]
+        costs_aug_norm = self.subproblem.get_costs(temp_batch, best_solutions_aug) # [BS*K*val_m]
         
-        # 4. Sélection des Vainqueurs (Best Augmentation)
-        # On reshape pour isoler la dimension val_m : [BS*K, val_m]
-        costs_view = costs_aug.view(n_splits_total, val_m)
+        # 3. Sélection du Meilleur val_m
+        costs_view = costs_aug_norm.view(n_splits_total, val_m)
+        min_vals_norm, min_idxs = torch.min(costs_view, dim=1) # [BS*K]
         
-        # On trouve l'index de la meilleure augmentation pour chaque sous-problème
-        min_vals, min_idxs = torch.min(costs_view, dim=1) # [BS*K]
-        
-        # On sélectionne les routes et indices gagnants
-        # Astuce : on utilise gather ou l'indexation avancée
-        # On veut extraire les lignes correspondantes dans les tenseurs augmentés
-        
-        # Index global dans le tenseur "aug" correspondant au meilleur val_m
-        # Ex: Si le split 0 a gagné avec l'aug 3, l'index est 0*val_m + 3
         selection_indices = torch.arange(n_splits_total, device=self.opts.device) * val_m + min_idxs
         
-        # [BS*K, Sub_Size] -> On a maintenant UNE solution par split (la meilleure)
         best_sols = best_solutions_aug[selection_indices]
         real_indices = original_indices_aug[selection_indices]
         
-        # 5. Reconstruction Vectorisée (Mapping Global)
+        # On récupère aussi le norm_factor correspondant au gagnant (bien que ce soit le même pour tout le split)
+        best_norm_factors = norm_factor[selection_indices] # [BS*K]
         
-        # Reshape pour séparer Batch et Splits : [BS, K, Sub_Size]
+        # 4. Reconstruction Vectorisée (Mapping Global)
         sols_view = best_sols.view(bs_real, K, -1)
         inds_view = real_indices.view(bs_real, K, -1)
-        
-        # Initialisation Routes Globales
         reconstructed_routes = torch.zeros((bs_real, self.total_size), dtype=torch.long, device=self.opts.device)
         
-        # A. Mapping Local -> Global
-        # mapped_sols[b, k, i] = Index global pointé par le nœud i du split k du batch b
+        # Mapping Local -> Global
         mapped_sols = torch.gather(inds_view, 2, sols_view)
+        reconstructed_routes.scatter_(1, inds_view.flatten(1), mapped_sols.flatten(1))
         
-        # On écrit tout dans la table globale (sauf les dummies, écrasés sans risque car distincts)
-        flat_inds = inds_view.flatten(1)       # [BS, K*Sub_Size]
-        flat_vals = mapped_sols.flatten(1)     # [BS, K*Sub_Size]
-        reconstructed_routes.scatter_(1, flat_inds, flat_vals)
-        
-        # 6. Couture (Daisy Chain) - C'est ici qu'on relie les splits
-        # Rappel : Chaque split k a ses PROPRES dummies.
-        # Le Split k va de Start_k ... à End_k.
-        # End_k pointe naturellement vers son dummy (Dummy_k).
-        # On veut changer ça : End_k doit pointer vers le dummy du split suivant (Dummy_{k+1}).
-        
-        # Identifier le Dummy du Split k (C'est toujours l'index 0 local)
-        # global_dummies[b, k] = Index global du dummy du split k
+        # 5. Couture (Daisy Chain)
         global_dummies = inds_view[:, :, 0] 
+        local_end_indices = (sols_view == 0).float().argmax(dim=2)
+        global_ends = torch.gather(inds_view, 2, local_end_indices.unsqueeze(2)).squeeze(2)
         
-        # Identifier le nœud de FIN du Split k (Celui qui pointe vers 0 localement)
-        # Correction : On filtre pour ne prendre que les nœuds réellement visités qui pointent vers 0
-        # (Sinon on risque de prendre un nœud inutilisé qui pointe vers 0 par défaut, brisant la boucle)
-        visited_times = self.subproblem.get_order(best_sols, return_solution=False) # [BS*K, Sub_Size]
-        visited_times_view = visited_times.view(bs_real, K, -1)
-        
-        valid_exits = (sols_view == 0) & (visited_times_view > 0)
-        
-        local_end_indices = valid_exits.float().argmax(dim=2) # [BS, K]
-        # local_end_indices = (sols_view == 0).float().argmax(dim=2) # [BS, K] (OLD)
+        # Split i -> Split i+1
+        reconstructed_routes.scatter_(1, global_ends[:, :-1], global_dummies[:, 1:])
+        # Dernier Split -> Premier Dummy (Dépôt Global)
+        reconstructed_routes.scatter_(1, global_ends[:, -1].unsqueeze(1), global_dummies[:, 0].unsqueeze(1))
 
-        # Convertir en index global (Source du lien à modifier)
-        global_ends = torch.gather(inds_view, 2, local_end_indices.unsqueeze(2)).squeeze(2) # [BS, K]
+        # 6. Calcul du Coût Réel Final
+        # Coût Réel = Coût Norm * Scale
+        costs_real = min_vals_norm * best_norm_factors
+        total_cost = costs_real.view(bs_real, K).sum(dim=1)
         
-        # Connexions :
-        # Split 0 -> Split 1 -> ... -> Split K-1 -> Split 0 (ou Dépôt Global)
-        
-        # Sources : Les fins des splits 0 à K-2
-        sources = global_ends[:, :-1] # [BS, K-1]
-        # Cibles : Les dummies des splits 1 à K-1
-        targets = global_dummies[:, 1:] # [BS, K-1]
-        
-        # Appliquer la redirection
-        reconstructed_routes.scatter_(1, sources, targets)
-        
-        # Cas spécial : Le dernier split doit pointer vers le tout premier dummy (le vrai dépôt global)
-        # Si Dummy_0 est le dépôt global, on pointe vers global_dummies[:, 0]
-        last_source = global_ends[:, -1].unsqueeze(1)
-        first_dummy = global_dummies[:, 0].unsqueeze(1)
-        reconstructed_routes.scatter_(1, last_source, first_dummy)
-
-        # 7. Finalisation
-        # Coût total = Somme des coûts MINIMAUX trouvés à l'étape 4
-        # min_vals est [BS*K], on reshape en [BS, K] et on somme
-        total_cost = min_vals.view(bs_real, K).sum(dim=1)
-        
-        # Ordonner pour l'affichage (optionnel, mais propre)
         rec_ordered = self.problem.get_order(reconstructed_routes, True)
         
         return {
             'total_cost': total_cost,
             'routes': rec_ordered,
-            'sub_costs': min_vals.view(bs_real, K),
+            'sub_costs': costs_real.view(bs_real, K), # Coûts réels par split
             'pre_manip' : reconstructed_routes
         }
         
@@ -430,8 +430,8 @@ class DNC():
                 record = True,
                 show_bar = show_bar
             )
-            sub_batch = self.divider(batch)
-            result = self.reconstruct(batch, sub_batch, rollout_output)
+            
+            result = self.reconstruct(batch, rollout_output)
         return result, rollout_output
     
     def start_inference(self, problem, tb_logger, val_dataset=None, input_batch=None, conquer=False):

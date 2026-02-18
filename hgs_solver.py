@@ -1,51 +1,47 @@
 import torch
 import numpy as np
 import multiprocessing
+import os
 import pyvrp
 
+# La fonction _solve_worker doit être définie au niveau module (top-level)
+# pour être "picklable" par multiprocessing.
 def _solve_worker(args):
-    """Worker function to solve a single CVRP instance using PyVRP.
-    Args:
-        depot is a 1D array of shape (2,) containing the (x, y) coordinates of the depot.   
-        coords is a 2D array of shape (real_size, 2) containing the (x, y) coordinates of the customers.
-        deliveries is a 1D array of shape (real_size,) containing the int demand of each customer.
-        capacity is an int scalar representing the vehicle capacity.
-        time_limit is the maximum time allowed for solving this instance (in seconds).
-        
-        deliveries, capacity and coordinates are already rescaled to the scale factor and converted to integers.
-        
-        Returns: the scaled cost of the solution found by PyVRP, or infinity if no feasible solution is found within the time limit.
-        """
     depot, coords, demands, capacity, time_limit, scale_factor = args
 
+    # ... (le début de votre fonction reste identique) ...
     m = pyvrp.Model()
-    
     real_size = coords.shape[0]
 
-    depot = m.add_depot(
-        x=depot[0], 
-        y=depot[1], 
-        name="Depot"
-    )
-    
+    # Ajout du dépôt et des clients
+    depot_loc = m.add_depot(x=depot[0], y=depot[1], name="Depot")
     vehicles = m.add_vehicle_type(num_available=real_size, capacity=capacity)
     
+    clients = []
     for i, demand in enumerate(demands):
-        m.add_client(
+        clients.append(m.add_client(
             x=float(coords[i][0]),
             y=float(coords[i][1]),
             delivery=int(demand),
             name=f"Client {i + 1}",
-        )
+        ))
 
-    for frm in m.locations:
-        for to in m.locations:
+    # OPTIMISATION (Voir note plus bas) : 
+    # PyVRP calcule automatiquement les distances euclidiennes si on ne précise rien.
+    # Votre boucle manuelle est très lente. Si vous voulez forcer les distances entières :
+    # Il vaut mieux le faire sans recréer des np.array à chaque itération.
+    # Pour l'instant, je garde votre logique mais notez que c'est un goulot d'étranglement.
+    locations = [depot_loc] + clients
+    for frm in locations:
+        for to in locations:
             if frm != to:
-                dist = int(np.linalg.norm(np.array([frm.x, frm.y]) - np.array([to.x, to.y])))
+                # Optimisation légère ici : éviter np.linalg.norm sur des scalaires
+                dx = frm.x - to.x
+                dy = frm.y - to.y
+                dist = int((dx**2 + dy**2)**0.5) 
                 m.add_edge(frm, to, distance=dist)
 
     res = m.solve(stop=pyvrp.stop.MaxRuntime(time_limit))
-    
     cost = res.cost() if res.is_feasible() else float('inf')
     
     return cost / scale_factor
@@ -65,25 +61,27 @@ class HGSSolver:
         return np.array(t)
 
     def __call__(self, batch, capacity=1.0):
-        coords_ = batch['coordinates'] # shape: (batch_size, size, 2)
-        demands_ = batch['demand'] # shape: (batch_size, size)
+        # 1. Préparation des données (identique à votre code)
+        coords_ = batch['coordinates']
+        demands_ = batch['demand']
         
         depot = coords_[:, 0, :]
-        
         coords = coords_[:, self.dummy_size:, :]
         demands = demands_[:, self.dummy_size:]
 
-        depot = self._tensor_to_numpy(depot)*self.scale_factor
+        # Conversions numpy
+        depot = self._tensor_to_numpy(depot) * self.scale_factor
         depot = depot.astype(int)
-        coords = self._tensor_to_numpy(coords)*self.scale_factor
+        coords = self._tensor_to_numpy(coords) * self.scale_factor
         coords = coords.astype(int)
-        demands = self._tensor_to_numpy(demands)*self.scale_factor
+        demands = self._tensor_to_numpy(demands) * self.scale_factor
         demands = demands.astype(int)
-        capacity = int(capacity*self.scale_factor)
+        capacity = int(capacity * self.scale_factor)
 
         batch_size = depot.shape[0]
+        
+        # 2. Création de la liste des tâches
         tasks = []
-
         for i in range(batch_size):
             tasks.append((
                 depot[i],
@@ -94,11 +92,12 @@ class HGSSolver:
                 self.scale_factor
             ))
 
-        from hgs_solver import _solve_worker
+        # 3. PARALLÉLISATION ICI
+        # On utilise le nombre de coeurs CPU disponibles, limité à la taille du batch
+        num_workers = min(os.cpu_count(), batch_size)
         
-        results = [] # temporary way until multiprocessing is implemented
-        for task in tasks:
-            result = _solve_worker(task)
-            results.append(result)
+        # Création du Pool et exécution map
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            results = pool.map(_solve_worker, tasks)
     
         return results
