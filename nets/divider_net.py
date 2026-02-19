@@ -56,45 +56,72 @@ class NeuralDivider(nn.Module):
 
     def get_balanced_assignments(self, probs, greedy=False):
         """
-        Surcharge de la méthode parente pour inclure le SHUFFLE des clusters.
-        Cela évite que le cluster 0 soit toujours servi en premier et soit le 'meilleur'.
+        Assignation globale basée sur la probabilité maximale absolue.
+        Aucun cluster n'est favorisé : les assignations se font dans l'ordre 
+        strict des probabilités décroissantes, tout en respectant les capacités.
         """
         B, N, K = probs.size()
         device = probs.device
         target_size = N // K
         
+        # Initialisations
         assignments = torch.zeros(B, N, dtype=torch.long, device=device)
-        selected_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
         log_probs_total = torch.zeros(B, device=device)
         
-        remaining_probs = probs.clone()
+        # Suivi des contraintes
+        node_assigned = torch.zeros(B, N, dtype=torch.bool, device=device)
+        cluster_counts = torch.zeros(B, K, dtype=torch.long, device=device)
         
-        # --- AMÉLIORATION : Ordre aléatoire ---
-        # On mélange l'ordre de traitement [0, 1, 2, 3] -> [2, 0, 3, 1]
-        cluster_order = torch.randperm(K, device=device)
+        # --- 1. TRI GLOBAL ---
+        # On aplatit les probabilités [B, N*K] pour les trier globalement
+        flat_probs = probs.view(B, -1)
+        sorted_probs, sorted_indices = torch.sort(flat_probs, dim=1, descending=True)
         
-        for i in range(K):
-            k = cluster_order[i].item()
-            
-            p_k = remaining_probs[:, :, k]
-            p_k[selected_mask] = -1.0 # Masque les noeuds déjà pris
-            
-            # Sélection des meilleurs candidats pour ce cluster
-            _, top_indices = torch.topk(p_k, k=target_size, dim=1)
-            
-            assignments.scatter_(1, top_indices, k)
-            selected_mask.scatter_(1, top_indices, True)
-            
-            if not greedy:
-                # Accumulation des log-probs pour le gradient RL
-                selected_probs = torch.gather(probs[:, :, k], 1, top_indices)
-                log_probs_total += torch.log(selected_probs + 1e-10).sum(dim=1)
-
-        # Calcul d'entropie pour monitoring
-        dist = Categorical(probs)
-        entropy = dist.entropy().mean(dim=1)
+        # On décode les indices plats pour retrouver le Nœud (n) et le Cluster (k)
+        # Exemple: index 5 avec K=4 -> Noeud 1 (5//4), Cluster 1 (5%4)
+        nodes = sorted_indices // K  # [B, N*K]
+        clusters = sorted_indices % K # [B, N*K]
         
-        return assignments, log_probs_total, entropy
+        batch_idx = torch.arange(B, device=device)
+        
+        # --- 2. ASSIGNATION ITÉRATIVE PAR ORDRE DE CONFIANCE ---
+        # On parcourt les choix du plus probable au moins probable
+        for i in range(N * K):
+            # Pour chaque élément du batch, on regarde son i-ème choix préféré
+            n = nodes[:, i]
+            k = clusters[:, i]
+            
+            # Vérification des contraintes :
+            # 1. Le noeud 'n' ne doit pas être déjà assigné
+            valid_node = ~node_assigned[batch_idx, n]
+            # 2. Le cluster 'k' ne doit pas être plein
+            valid_cluster = cluster_counts[batch_idx, k] < target_size
+            
+            # Le mouvement est valide si les deux contraintes sont respectées
+            valid = valid_node & valid_cluster
+            
+            if valid.any():
+                # On applique l'assignation uniquement pour les éléments valides du batch
+                valid_b = batch_idx[valid]
+                valid_n = n[valid]
+                valid_k = k[valid]
+                
+                # Mise à jour de la solution et des masques
+                assignments[valid_b, valid_n] = valid_k
+                node_assigned[valid_b, valid_n] = True
+                cluster_counts[valid_b, valid_k] += 1
+                
+                # Accumulation de la log-probabilité pour l'apprentissage (REINFORCE)
+                if not greedy:
+                    valid_probs = probs[valid_b, valid_n, valid_k]
+                    log_probs_total[valid_b] += torch.log(valid_probs + 1e-10)
+            
+            # Condition d'arrêt anticipée (Optimisation de vitesse) :
+            # Si tous les noeuds de tout le batch sont assignés, on arrête la boucle
+            if node_assigned.all():
+                break
+        
+        return assignments, log_probs_total
 
     def forward(self, batch, greedy=False):
         """
