@@ -204,7 +204,7 @@ class DNC():
         else:
             if hasattr(self, 'divider') and isinstance(self.divider, NeuralDivider):
                 with torch.no_grad():
-                     assignments, _, _ = self.divider(batch, greedy=True)
+                     assignments, _ = self.divider(batch, greedy=True)
                 sub_batch_data = self.divider.make_sub_batch(batch, assignments)
             else:
                 sub_batch_data = self.divider.make_sub_batch(batch)

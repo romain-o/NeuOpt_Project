@@ -27,8 +27,9 @@ class NeuralDivider(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
 
-        # 3. Logits Head
-        self.to_logits = nn.Linear(hidden_dim, self.n_splits) 
+        self.cluster_queries = nn.Parameter(torch.randn(self.n_splits, hidden_dim))
+        self.project_context = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.project_k = nn.Linear(hidden_dim, hidden_dim)
 
     def log_sinkhorn(self, log_alpha, n_iters):
         """
@@ -57,112 +58,136 @@ class NeuralDivider(nn.Module):
     def get_balanced_assignments(self, probs, greedy=False):
         """
         Assignation globale basée sur la probabilité maximale absolue.
-        Aucun cluster n'est favorisé : les assignations se font dans l'ordre 
-        strict des probabilités décroissantes, tout en respectant les capacités.
+        Version optimisée pour garantir le tracking du gradient (Autograd safe).
         """
         B, N, K = probs.size()
         device = probs.device
         target_size = N // K
         
-        # Initialisations
+        # Initialisations (Pas besoin d'initialiser log_probs_total ici)
         assignments = torch.zeros(B, N, dtype=torch.long, device=device)
-        log_probs_total = torch.zeros(B, device=device)
-        
-        # Suivi des contraintes
         node_assigned = torch.zeros(B, N, dtype=torch.bool, device=device)
         cluster_counts = torch.zeros(B, K, dtype=torch.long, device=device)
         
         # --- 1. TRI GLOBAL ---
-        # On aplatit les probabilités [B, N*K] pour les trier globalement
         flat_probs = probs.view(B, -1)
         sorted_probs, sorted_indices = torch.sort(flat_probs, dim=1, descending=True)
         
-        # On décode les indices plats pour retrouver le Nœud (n) et le Cluster (k)
-        # Exemple: index 5 avec K=4 -> Noeud 1 (5//4), Cluster 1 (5%4)
-        nodes = sorted_indices // K  # [B, N*K]
-        clusters = sorted_indices % K # [B, N*K]
+        nodes = sorted_indices // K 
+        clusters = sorted_indices % K 
         
         batch_idx = torch.arange(B, device=device)
         
-        # --- 2. ASSIGNATION ITÉRATIVE PAR ORDRE DE CONFIANCE ---
-        # On parcourt les choix du plus probable au moins probable
+        # --- 2. ASSIGNATION ITÉRATIVE (Sans toucher aux gradients) ---
         for i in range(N * K):
-            # Pour chaque élément du batch, on regarde son i-ème choix préféré
             n = nodes[:, i]
             k = clusters[:, i]
             
-            # Vérification des contraintes :
-            # 1. Le noeud 'n' ne doit pas être déjà assigné
             valid_node = ~node_assigned[batch_idx, n]
-            # 2. Le cluster 'k' ne doit pas être plein
             valid_cluster = cluster_counts[batch_idx, k] < target_size
-            
-            # Le mouvement est valide si les deux contraintes sont respectées
             valid = valid_node & valid_cluster
             
             if valid.any():
-                # On applique l'assignation uniquement pour les éléments valides du batch
                 valid_b = batch_idx[valid]
                 valid_n = n[valid]
                 valid_k = k[valid]
                 
-                # Mise à jour de la solution et des masques
                 assignments[valid_b, valid_n] = valid_k
                 node_assigned[valid_b, valid_n] = True
                 cluster_counts[valid_b, valid_k] += 1
-                
-                # Accumulation de la log-probabilité pour l'apprentissage (REINFORCE)
-                if not greedy:
-                    valid_probs = probs[valid_b, valid_n, valid_k]
-                    log_probs_total[valid_b] += torch.log(valid_probs + 1e-10)
             
-            # Condition d'arrêt anticipée (Optimisation de vitesse) :
-            # Si tous les noeuds de tout le batch sont assignés, on arrête la boucle
             if node_assigned.all():
                 break
+
+        # --- 3. REINFORCE GRADIENT TRACKING (Le FIX) ---
+        # On extrait les probabilités des actions finales de manière vectorisée.
+        # Cela crée un lien direct et propre avec `probs` pour le backward pass.
+        if not greedy:
+            # probs: [B, N, K]
+            # assignments: [B, N] -> [B, N, 1]
+            # chosen_probs: [B, N]
+            chosen_probs = torch.gather(probs, 2, assignments.unsqueeze(-1)).squeeze(-1)
+            
+            # Somme des log-probabilités pour le batch entier
+            log_probs_total = torch.log(chosen_probs + 1e-10).sum(dim=1) # [B]
+        else:
+            log_probs_total = torch.zeros(B, device=device)
         
         return assignments, log_probs_total
 
     def forward(self, batch, greedy=False):
-        """
-        Args:
-            coords: [Batch, N_clients, 2] (No dummies here)
-            demand: [Batch, N_clients]
-        """
-        # 1. Input concatenation [B, N, 3]
-        N_DUMMIES = int(self.opts.dummy_rate * self.opts.graph_size) # 200 if graph_size=400
-        clients_coords = batch['coordinates'][:, N_DUMMIES:, :] # [B, 400, 2]
-        clients_demand = batch['demand'][:, N_DUMMIES:]         # [B, 400]
-        if clients_demand.dim() == 2:
-            d = clients_demand.unsqueeze(-1)
-        else:
-            d = clients_demand
+        # --- 1. PRÉPARATION ET ENCODAGE ---
+        coords = batch['coordinates']
+        B, Total, _ = coords.size()
+        N_DUMMIES = Total // self.opts.dnc_n_splits
+        
+        clients_coords = coords[:, N_DUMMIES:, :] 
+        clients_demand = batch['demand'][:, N_DUMMIES:]
+        d = clients_demand.unsqueeze(-1)
+        
         x = torch.cat([clients_coords, d], dim=-1)
         
-        # 2. Encode
-        h = self.embed(x)
-        h = self.encoder(h) # [B, N, H]
+        # Encodage des noeuds: [B, N, H]
+        h = self.encoder(self.embed(x)) 
         
-        # 3. Logits & Sinkhorn
-        logits = self.to_logits(h) # [B, N, K]
-        if not greedy:
-            u = torch.rand_like(logits)
-            gumbel = -torch.log(-torch.log(u + 1e-10) + 1e-10)
-            logits_noisy = (logits + gumbel) / self.tau
-        else:
-            logits_noisy = logits / self.tau
+        # Contexte global (moyenne du graphe): [B, H]
+        graph_context = h.mean(dim=1) 
         
-        # Apply Sinkhorn to encourage balanced scores
-        log_P = self.log_sinkhorn(logits_noisy, self.n_sinkhorn_iters)
-        probs = torch.exp(log_P)
+        # Clés pour l'attention: [B, N, H]
+        keys = self.project_k(h) 
+
+        # --- 2. INITIALISATIONS DU DÉCODAGE ---
+        B, N, _ = h.size()
+        K = self.n_splits
+        target_size = N // K
+
+        assignments = torch.zeros(B, N, dtype=torch.long, device=h.device)
+        visited_mask = torch.zeros(B, N, dtype=torch.bool, device=h.device)
         
-        # 4. Assignment with strict size constraints
-        # We generally use Greedy=True during inference to get stable splits
-        # During training, we might add noise to logits before Sinkhorn if we want exploration,
-        # but here we rely on the probabilistic nature of the output for the loss.
-        assignments, log_probs_sum, entropy = self.get_balanced_assignments(probs, greedy=greedy)
+        log_probs_total = torch.zeros(B, device=h.device)
+
+        # --- 3. DÉCODAGE SÉQUENTIEL (N étapes) ---
+        for k in range(K):
+            # L'ancre de base pour le cluster k: [B, H]
+            cluster_q = self.cluster_queries[k].unsqueeze(0).expand(B, -1) 
             
-        return assignments, log_probs_sum, entropy
+            # Au début d'un cluster, le "dernier noeud" est simplement l'ancre
+            last_node_embed = cluster_q 
+
+            for step in range(target_size):
+                # A. Construction de la Query contextuelle
+                # On concatène les 3 informations cruciales
+                context = torch.cat([graph_context, cluster_q, last_node_embed], dim=-1)
+                query = self.project_context(context).unsqueeze(1) # [B, 1, H]
+
+                # B. Calcul de l'Attention (Dot-Product simple)
+                # scores: [B, 1, N] -> [B, N]
+                scores = torch.bmm(query, keys.transpose(1, 2)).squeeze(1) / (self.hidden_dim ** 0.5)
+
+                # C. Masquage strict (Interdit de reprendre un noeud)
+                scores[visited_mask] = -float('inf')
+
+                # D. Probabilités et Échantillonnage
+                probs = F.softmax(scores, dim=1)
+                dist = Categorical(probs)
+
+                if greedy:
+                    selected = probs.argmax(dim=1)
+                else:
+                    selected = dist.sample()
+                    log_probs_total += dist.log_prob(selected)
+
+
+                # E. Mise à jour de l'état
+                assignments.scatter_(1, selected.unsqueeze(1), k)
+                visited_mask.scatter_(1, selected.unsqueeze(1), True)
+
+                # F. Mise à jour du contexte pour la prochaine étape
+                # Le prochain noeud cherchera autour de celui qu'on vient de sélectionner
+                last_node_embed = h[torch.arange(B), selected]
+
+        # On moyenne l'entropie sur les N étapes
+        return assignments, log_probs_total
 
     def normalize(self, coords):
         """

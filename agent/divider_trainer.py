@@ -40,7 +40,7 @@ class DividerTrainer:
             rollout_out = self.agent.rollout(
                 problem=self.agent.subproblem, 
                 batch=batch, 
-                T=1, # Greedy
+                T=100,
                 val_m=1,
                 record=False,
                 stall_limit=self.opts.stall_limit
@@ -71,7 +71,7 @@ class DividerTrainer:
             # --- 1. Forward Pass ---
             # assignments: [B, N]
             # log_probs_sum: [B] (C'est la somme des log_prob de tous les noeuds)
-            assignements, log_probs_sum, entropy = self.model(
+            assignements, log_probs_sum = self.model(
                 batch,
                 greedy=False
             )
@@ -112,7 +112,7 @@ class DividerTrainer:
             # Note : On réduit aussi le coeff d'entropie car log_probs_mean est beaucoup plus petit maintenant
             entropy_coef = 0.001 
             
-            loss = -(advantage * log_probs_mean).mean() - (entropy_coef * entropy.mean())
+            loss = -(advantage * log_probs_mean).mean()
             
             # --- 6. Optimization ---
             self.optimizer.zero_grad()
