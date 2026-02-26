@@ -3,6 +3,42 @@ import torch.optim as optim
 import os
 from tqdm import tqdm
 from datetime import datetime
+import matplotlib.pyplot as plt
+
+def save_subdivision_plot(batch, assignments, epoch, save_dir, idx=0, dummy_rate=0.5):
+    """
+    Sauvegarde une image du graphe subdivisé.
+    idx: l'index du graphe dans le batch qu'on veut dessiner (ex: 0).
+    """
+    # Extraction des données sur CPU pour Matplotlib
+    coords = batch['coordinates'][idx].cpu().numpy()
+    assigns = assignments[idx].cpu().numpy()
+    
+    # Calcul des Dummies
+    N_Total = coords.shape[0]
+    N_clients = int(N_Total // (1 + dummy_rate)) # Ajustez si votre formule est différente
+    N_DUMMIES = N_Total - N_clients
+    
+    plt.figure(figsize=(8, 8))
+    
+    # 1. Tracé du/des Dépôts (Carrés rouges)
+    plt.scatter(coords[:N_DUMMIES, 0], coords[:N_DUMMIES, 1], 
+                c='red', marker='s', s=80, label='Dépôt', zorder=5)
+    
+    # 2. Tracé des Clients (Ronds colorés par cluster)
+    clients_coords = coords[N_DUMMIES:]
+    scatter = plt.scatter(clients_coords[:, 0], clients_coords[:, 1], 
+                          c=assigns, cmap='tab10', s=40, alpha=0.8)
+    
+    plt.title(f"Évolution de la Subdivision - Époque {epoch}")
+    
+    # Création du dossier si nécessaire et sauvegarde
+    os.makedirs(save_dir, exist_ok=True)
+    filepath = os.path.join(save_dir, f"subdivision_epoch_{epoch:03d}.png")
+    plt.savefig(filepath, dpi=150, bbox_inches='tight')
+    
+    # CRUCIAL : Fermer la figure pour éviter une fuite de RAM (Memory Leak)
+    plt.close()
 
 class DividerTrainer:
     def __init__(self, divider_model, agent, opts):
@@ -17,13 +53,10 @@ class DividerTrainer:
         self.model = divider_model
         self.agent = agent
         self.opts = opts
+        self.pomo_M = opts.pomo_M
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=opts.lr_divider)
-        
-        # Baseline for REINFORCE (Exponential Moving Average)
-        self.baseline = None
-        self.beta = 0.9 
-        
+     
         os.makedirs(opts.save_dir, exist_ok=True)
 
     def get_reward(self, batch):
@@ -38,9 +71,9 @@ class DividerTrainer:
             # Call NeuOpt solver (Greedy decoding)
             # Ensure your agent's rollout method accepts this dict structure
             rollout_out = self.agent.rollout(
-                problem=self.agent.subproblem, 
+                problem=self.agent.problem, 
                 batch=batch, 
-                T=100,
+                T=50,
                 val_m=1,
                 record=False,
                 stall_limit=self.opts.stall_limit
@@ -62,63 +95,55 @@ class DividerTrainer:
         avg_loss = 0
         steps = 0
         
+        M = self.pomo_M
+        
+
+
         pbar = tqdm(dataloader, desc="Training Divider")
         
         for batch in pbar:
+            bs = batch['coordinates'].size(0)
+            Total_N = batch['coordinates'].size(1)
+            N_clients = self.opts.graph_size
+            N_dummies = Total_N - N_clients
+            K = self.model.n_splits
             # Move to GPU if needed (si dataloader ne le fait pas)
             batch = {k: v.to(self.opts.device, non_blocking=True) for k, v in batch.items()}
-        
+
+
+            # POMO Augmentation
+            batch_pomo = {}
+            for k,v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch_pomo[k] = v.repeat_interleave(M, dim=0)
+                else:
+                    batch_pomo[k] = v
+            random_indices = torch.argsort(torch.rand(bs * M, N_clients, device=self.opts.device), dim=1)
+            pomo_starts = random_indices[:, :K] # Shape: [B*M, K]
             # --- 1. Forward Pass ---
             # assignments: [B, N]
             # log_probs_sum: [B] (C'est la somme des log_prob de tous les noeuds)
+            self.optimizer.zero_grad()
             assignements, log_probs_sum = self.model(
-                batch,
-                greedy=False
+                batch_pomo,
+                greedy=False,
+                pomo_starts=pomo_starts
             )
             
-            sub_batch = self.model.make_sub_batch(batch, assignements) # [B*K, 150, 2]
+            sub_batch = self.model.make_sub_batch(batch_pomo, assignements) # [B*K, 150, 2]
             
             # --- 3. Compute Reward ---
             rewards = self.get_reward(sub_batch)
             rewards = rewards.to(log_probs_sum.device) # [B]
-            
-            # --- 4. REINFORCE Loss Stabilization ---
-            
-            # A. Baseline Update (Moyenne mobile)
-            if self.baseline is None:
-                self.baseline = rewards.mean().item()
-            else:
-                self.baseline = self.beta * self.baseline + (1 - self.beta) * rewards.mean().item()
-            
-            # B. Calcul de l'Avantage Brut
-            raw_advantage = rewards - self.baseline
-            
-            # C. Normalisation de l'Avantage (CRUCIAL POUR LA STABILITÉ)
-            # On centre l'avantage sur le batch courant : (x - mean) / std
-            # Cela aide si un batch contient des instances particulièrement dures ou faciles
-            if raw_advantage.size(0) > 1:
-                advantage = (raw_advantage - raw_advantage.mean()) / (raw_advantage.std() + 1e-8)
-            else:
-                advantage = raw_advantage
 
-            # D. Normalisation de la Log-Probabilité (CRUCIAL POUR LA TAILLE DU GRAPHE)
-            # log_probs_sum est la somme sur N noeuds (~ -500). 
-            # On divise par N pour ramener à une échelle raisonnable (~ -1.5).
-            N = self.opts.graph_size
-            log_probs_mean = log_probs_sum / N
+            rewards_reshaped = rewards.view(bs, M)
+            baseline = rewards_reshaped.mean(dim=1, keepdim=True)
+            advantage = rewards_reshaped - baseline
+            advantage = advantage.view(-1)
+              
+            loss = -(advantage.detach() * log_probs_sum).mean()
             
-            # --- 5. Loss Calculation ---
-            # Loss = - (Advantage_Norm * Log_Prob_Mean) - Entropy
-            # Note : On réduit aussi le coeff d'entropie car log_probs_mean est beaucoup plus petit maintenant
-            entropy_coef = 0.001 
-            
-            loss = -(advantage * log_probs_mean).mean()
-            
-            # --- 6. Optimization ---
-            self.optimizer.zero_grad()
             loss.backward()
-            
-            # Le gradient clipping aura maintenant du sens car la loss est à une échelle normale
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             
@@ -140,10 +165,15 @@ class DividerTrainer:
         base_dir = 'trained_divider/CVRP400'
         self.run_dir = os.path.join(base_dir, f"run_{timestamp}_resume_{start_epoch}")
         os.makedirs(self.run_dir, exist_ok=True)
-        print(f"🚀 Reprise de l'entraînement ! Logs : {self.run_dir}")
+        print(f"📁 Dossier de sauvegarde : {self.run_dir}")
+        image_save_dir = os.path.join(self.run_dir, "evolution_images")
+
 
         train_history = {'train_loss': [], 'train_reward': []}
         eval_history = {'val_reward': []}
+
+        vis_batch = next(iter(val_loader))
+        vis_batch = {k: v.to(self.opts.device) if isinstance(v, torch.Tensor) else v for k, v in vis_batch.items()}
         
         best_val_reward = -float('inf')
         # --- 3. Boucle d'entraînement ---
@@ -162,13 +192,28 @@ class DividerTrainer:
                 val_reward = self.eval(val_loader)
                 print(f"Val   | Reward: {val_reward:.2f}")
                 
+
+                self.model.eval() # On s'assure d'être en mode eval
+                with torch.no_grad():
+                    assignments, _ = self.model(vis_batch, greedy=True)
+                
+                    # On sauvegarde le graphe d'index 0
+                    save_subdivision_plot(
+                        batch=vis_batch, 
+                        assignments=assignments, 
+                        epoch=epoch, 
+                        save_dir=image_save_dir,
+                        idx=0,
+                        dummy_rate=self.opts.dummy_rate
+                    )
+
                 # 3. Sauvegardes Stratégiques
                 
                 # A. Toujours sauvegarder le "latest" (pour reprise rapide)
                 self.save(epoch, filename="checkpoint_latest.pt")
                 
                 # B. Sauvegarder l'historique tous les X époques
-                if epoch % 10 == 0:
+                if epoch % 1 == 0:
                     self.save(epoch, filename=f"checkpoint_epoch_{epoch}.pt")
                 
                 # C. Sauvegarder le meilleur modèle
@@ -199,9 +244,6 @@ class DividerTrainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'baseline': self.baseline, # <--- Très important !
-            # Optionnel : RNG states pour reproductibilité exacte
-            # 'rng_state': torch.get_rng_state(),
         }
         
         torch.save(checkpoint_dict, path)

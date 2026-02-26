@@ -57,6 +57,7 @@ def get_options(args=None):
     parser.add_argument('--warm_up', type=float, default=2) # the rho in the paper
     parser.add_argument('--max_grad_norm', type=float, default=0.05, help='Maximum L2 norm for gradient clipping, default 1.0 (0 to disable clipping)')
     parser.add_argument('--train_dataset', default=None, help='Path to the training dataset')
+    parser.add_argument('--pomo_M', type=int, default=6, help='POMO augmentation')
     
     ### network
     parser.add_argument('--v_range', type=float, default=6.)

@@ -43,6 +43,7 @@ class PPO:
         
         # figure out the options
         self.opts = opts
+        self.problem = problem
         
         # figure out the actor
         self.actor = Actor(
