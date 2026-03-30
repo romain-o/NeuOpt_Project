@@ -1,3 +1,4 @@
+from nets.divider_net_linear import NeuralDividerLinear
 import torch
 from nets.actor_network import Actor
 from nets.divider_net import NeuralDivider
@@ -202,7 +203,7 @@ class DNC():
         if 'norm_factor' in batch:
             sub_batch_data = batch
         else:
-            if hasattr(self, 'divider') and isinstance(self.divider, NeuralDivider):
+            if hasattr(self, 'divider') and (isinstance(self.divider, NeuralDivider) or isinstance(self.divider, NeuralDividerLinear)):
                 with torch.no_grad():
                      assignments, _ = self.divider(batch, greedy=True)
                 sub_batch_data = self.divider.make_sub_batch(batch, assignments)

@@ -20,6 +20,7 @@ def get_options(args=None):
     parser.add_argument('--use_assert', action='store_true', help='Enable Assertion')
     parser.add_argument('--seed', type=int, default=6666, help='Random seed to use')
     
+    
     ### NeuOpt configs
     parser.add_argument('--val_m', type=int, default=1) # number of augmentation, D2A=1 or D2A=5 in Table 1
     parser.add_argument('--stall_limit', type=int, default=10) # T_D2A in the paper, 0 means disable
@@ -58,6 +59,7 @@ def get_options(args=None):
     parser.add_argument('--max_grad_norm', type=float, default=0.05, help='Maximum L2 norm for gradient clipping, default 1.0 (0 to disable clipping)')
     parser.add_argument('--train_dataset', default=None, help='Path to the training dataset')
     parser.add_argument('--pomo_M', type=int, default=6, help='POMO augmentation')
+    parser.add_argument('--T_max_reward', type=int, default=50, help='Maximum number of steps for reward calculation using the pre-trained CVRP solver')
     
     ### network
     parser.add_argument('--v_range', type=float, default=6.)
@@ -69,6 +71,7 @@ def get_options(args=None):
     parser.add_argument('--normalization', default='layer', help="Normalization type, 'batch' (default) or 'instance'")
     parser.add_argument('--gamma', type=float, default=0.999, help='decrease future reward')
     parser.add_argument('--T_max', type=int, default=1000, help='number of steps to swap')
+    parser.add_argument('--temperature', type=float, default=2.5, help='Temperature for action selection in the divider')
     
     ### logs to tensorboard and screen
     parser.add_argument('--no_progress_bar', action='store_true', help='Disable progress bar')

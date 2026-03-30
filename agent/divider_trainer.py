@@ -4,6 +4,7 @@ import os
 from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
+from nets.divider_net_linear import NeuralDividerLinear
 
 def save_subdivision_plot(batch, assignments, epoch, save_dir, idx=0, dummy_rate=0.5):
     """
@@ -42,21 +43,20 @@ def save_subdivision_plot(batch, assignments, epoch, save_dir, idx=0, dummy_rate
 
 class DividerTrainer:
     def __init__(self, divider_model, agent, opts):
-        """
-        Trainer for the Learn-to-Divide model.
-        
-        Args:
-            divider_model: Instance of NeuralDivider
-            agent: Pre-trained NeuOpt agent (frozen) 'must have self.subproblem with greedy'
-            opts: Configuration options
-        """
         self.model = divider_model
         self.agent = agent
         self.opts = opts
-        self.pomo_M = opts.pomo_M
         
+        # Détection de l'algorithme selon la classe du modèle
+        self.use_pomo = not isinstance(self.model, NeuralDividerLinear)
+        self.pomo_M = opts.pomo_M if self.use_pomo else 1
+        
+        if self.use_pomo:
+            print(f"🚀 Algorithm: POMO (M={self.pomo_M})")
+        else:
+            print(f"🎯 Algorithm: REINFORCE (Batch Baseline)")
+
         self.optimizer = optim.Adam(self.model.parameters(), lr=opts.lr_divider)
-     
         os.makedirs(opts.save_dir, exist_ok=True)
 
     def get_reward(self, batch):
@@ -73,7 +73,7 @@ class DividerTrainer:
             rollout_out = self.agent.rollout(
                 problem=self.agent.problem, 
                 batch=batch, 
-                T=50,
+                T=self.opts.T_max_reward,
                 val_m=1,
                 record=False,
                 stall_limit=self.opts.stall_limit
@@ -95,56 +95,51 @@ class DividerTrainer:
         avg_loss = 0
         steps = 0
         
-        M = self.pomo_M
-        
-
-
-        pbar = tqdm(dataloader, desc="Training Divider")
+        pbar = tqdm(dataloader, desc=f"Training Divider ({'POMO' if self.use_pomo else 'REINFORCE'})")
         
         for batch in pbar:
             bs = batch['coordinates'].size(0)
-            Total_N = batch['coordinates'].size(1)
             N_clients = self.opts.graph_size
-            N_dummies = Total_N - N_clients
             K = self.model.n_splits
-            # Move to GPU if needed (si dataloader ne le fait pas)
-            batch = {k: v.to(self.opts.device, non_blocking=True) for k, v in batch.items()}
+            batch = {k: v.to(self.opts.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
 
-
-            # POMO Augmentation
-            batch_pomo = {}
-            for k,v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch_pomo[k] = v.repeat_interleave(M, dim=0)
-                else:
-                    batch_pomo[k] = v
-            random_indices = torch.argsort(torch.rand(bs * M, N_clients, device=self.opts.device), dim=1)
-            pomo_starts = random_indices[:, :K] # Shape: [B*M, K]
-            # --- 1. Forward Pass ---
-            # assignments: [B, N]
-            # log_probs_sum: [B] (C'est la somme des log_prob de tous les noeuds)
             self.optimizer.zero_grad()
-            assignements, log_probs_sum = self.model(
-                batch_pomo,
-                greedy=False,
-                pomo_starts=pomo_starts
-            )
-            
-            sub_batch = self.model.make_sub_batch(batch_pomo, assignements) # [B*K, 150, 2]
-            
-            # --- 3. Compute Reward ---
-            rewards = self.get_reward(sub_batch)
-            rewards = rewards.to(log_probs_sum.device) # [B]
 
-            rewards_reshaped = rewards.view(bs, M)
-            baseline = rewards_reshaped.mean(dim=1, keepdim=True)
-            advantage = rewards_reshaped - baseline
-            advantage = advantage.view(-1)
-              
+            if self.use_pomo:
+                # --- LOGIQUE POMO ---
+                M = self.pomo_M
+                batch_input = {k: v.repeat_interleave(M, dim=0) for k, v in batch.items()}
+                
+                random_indices = torch.argsort(torch.rand(bs * M, N_clients, device=self.opts.device), dim=1)
+                pomo_starts = random_indices[:, :K]
+                
+                assignments, log_probs_sum = self.model(batch_input,进入greedy=False, pomo_starts=pomo_starts)
+                
+                sub_batch = self.model.make_sub_batch(batch_input, assignments)
+                rewards = self.get_reward(sub_batch).to(log_probs_sum.device) # [bs * M]
+
+                # Baseline par instance (moyenne des M trajectoires)
+                rewards_reshaped = rewards.view(bs, M)
+                baseline = rewards_reshaped.mean(dim=1, keepdim=True)
+                advantage = (rewards_reshaped - baseline).view(-1)
+            
+            else:
+                # --- LOGIQUE REINFORCE (NeuralDividerLinear) ---
+                # Pas de pomo_starts, pas de répétition
+                assignments, log_probs_sum = self.model(batch,greedy=False)
+                
+                sub_batch = self.model.make_sub_batch(batch, assignments)
+                rewards = self.get_reward(sub_batch).to(log_probs_sum.device) # [bs]
+
+                # Baseline par batch (moyenne de toutes les instances du batch)
+                baseline = rewards.mean()
+                advantage = rewards - baseline
+
+            # Calcul de la Loss (Policy Gradient)
             loss = -(advantage.detach() * log_probs_sum).mean()
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             
             # Logging
@@ -152,7 +147,12 @@ class DividerTrainer:
             avg_loss += loss.item()
             steps += 1
             
-            pbar.set_postfix({'Rw': f"{-rewards.mean().item():.2f}", 'Loss': f"{loss.item():.4f}"})
+            pbar.set_postfix({
+                'Rw': f"{-rewards.mean().item():.2f}", 
+                'Loss': f"{loss.item():.4f}", 
+                'Adv_abs': f"{advantage.abs().mean().item():.4f}",
+                'Grad': f"{grad_norm.item():.2f}"
+            })
             
         return avg_loss / steps, avg_reward / steps
 
@@ -161,6 +161,8 @@ class DividerTrainer:
         # --- Création du dossier (Nouveau dossier pour la reprise ou suite ?) ---
         # Si on reprend, on crée quand même un nouveau dossier "run_..." pour ne pas mélanger
         # les logs, mais le modèle partira bien des poids entraînés.
+        if isinstance(self.agent.divider, NeuralDividerLinear):
+            model_type = "NN_linear_divider"
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         base_dir = 'trained_divider/CVRP400'
         self.run_dir = os.path.join(base_dir, f"run_{timestamp}_resume_{start_epoch}")
@@ -179,6 +181,11 @@ class DividerTrainer:
         # --- 3. Boucle d'entraînement ---
         try: # Début du bloc de protection
             for epoch in range(start_epoch, n_epochs):
+                prev_weights = {
+                    name: param.clone().detach() 
+                    for name, param in self.model.named_parameters() 
+                    if param.requires_grad
+                }
                 progress = epoch / n_epochs
                 current_tau = max(0.1, 1.0 - progress) 
                 self.model.tau = current_tau
@@ -186,7 +193,15 @@ class DividerTrainer:
                 
                 # 1. Train
                 avg_loss, avg_reward = self.train_one_epoch(train_loader)
+                total_weight_diff = 0.0
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad:
+                        # Différence euclidienne (norme L2) entre les anciens et nouveaux poids
+                        diff = torch.norm(param.data - prev_weights[name]).item()
+                        total_weight_diff += diff
+                        
                 print(f"Train | Reward: {avg_reward:.2f} | Loss: {avg_loss:.4f}")
+                print(f"Δ Poids (Weight Update) : {total_weight_diff:.6f}")
                 
                 # 2. Validation (Optionnel à chaque époque si trop lent)
                 val_reward = self.eval(val_loader)
@@ -206,17 +221,11 @@ class DividerTrainer:
                         idx=0,
                         dummy_rate=self.opts.dummy_rate
                     )
-
-                # 3. Sauvegardes Stratégiques
-                
-                # A. Toujours sauvegarder le "latest" (pour reprise rapide)
                 self.save(epoch, filename="checkpoint_latest.pt")
-                
-                # B. Sauvegarder l'historique tous les X époques
-                if epoch % 1 == 0:
+
+                if epoch % 10 == 0:
                     self.save(epoch, filename=f"checkpoint_epoch_{epoch}.pt")
                 
-                # C. Sauvegarder le meilleur modèle
                 if val_reward > best_val_reward:
                     best_val_reward = val_reward
                     self.save(epoch, is_best=True)

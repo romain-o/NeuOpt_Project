@@ -139,3 +139,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# ProjectCVRP
+
+instruction_run.txt
+runs/
+XML/
+trained_divider/
+*.py
+
+

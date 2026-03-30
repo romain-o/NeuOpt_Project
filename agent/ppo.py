@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from tensorboard_logger import Logger as TbLogger
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import random
 
@@ -203,7 +203,8 @@ class PPO:
         out = (obj[:,1].reshape(bs, val_m).min(1)[0], # batch_size, 1
                torch.stack(obj_history,1).view(bs, val_m, T+1, -1).min(1)[0], # batch_size, T, 2/3
                torch.stack(reward,1).view(bs, val_m, T).max(1)[0], # batch_size, T
-               None if not record else (solution_history, solution_best_history, feasible_history_recorded)
+               None if not record else (solution_history, solution_best_history, feasible_history_recorded),
+               solution_best
               )
         
         return out
@@ -248,7 +249,7 @@ def train(rank, problem, agent, val_dataset, tb_logger):
                                                                device_ids=[rank])
             
         if not opts.no_tb and rank == 0:
-            tb_logger = TbLogger(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, 
+            tb_logger = SummaryWriter(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, 
                                                           opts.graph_size), opts.run_name))
     else:
         for state in agent.optimizer.state.values():

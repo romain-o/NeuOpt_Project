@@ -32,79 +32,12 @@ class NeuralDivider(nn.Module):
         self.project_context = nn.Linear(hidden_dim * 3, hidden_dim)
         self.project_k = nn.Linear(hidden_dim, hidden_dim)
 
-    def log_sinkhorn(self, log_alpha, n_iters):
-        """
-        Applies Sinkhorn algorithm in log-space to produce a doubly stochastic matrix.
-        Crucial for encouraging equal-sized clusters.
-        """
-        batch_size, n, k = log_alpha.size()
-        log_P = log_alpha
-
-        
-        target_col_sum = torch.log(torch.tensor(n / k, device=log_alpha.device))
-        
-        for _ in range(n_iters):
-            log_P = log_P - torch.logsumexp(log_P, dim=2, keepdim=True)
-
-            current_col_sum = torch.logsumexp(log_P, dim=1, keepdim=True)
-            log_P = log_P + (target_col_sum - current_col_sum)
-            
-        return log_P
-
-    def get_balanced_assignments(self, probs, greedy=False):
-        """
-        Assignation globale basée sur la probabilité maximale absolue.
-        Version optimisée pour garantir le tracking du gradient (Autograd safe).
-        """
-        B, N, K = probs.size()
-        device = probs.device
-        target_size = N // K
-        
-        assignments = torch.zeros(B, N, dtype=torch.long, device=device)
-        node_assigned = torch.zeros(B, N, dtype=torch.bool, device=device)
-        cluster_counts = torch.zeros(B, K, dtype=torch.long, device=device)
-
-        flat_probs = probs.view(B, -1)
-        sorted_probs, sorted_indices = torch.sort(flat_probs, dim=1, descending=True)
-        
-        nodes = sorted_indices // K 
-        clusters = sorted_indices % K 
-        
-        batch_idx = torch.arange(B, device=device)
-        
-        for i in range(N * K):
-            n = nodes[:, i]
-            k = clusters[:, i]
-            
-            valid_node = ~node_assigned[batch_idx, n]
-            valid_cluster = cluster_counts[batch_idx, k] < target_size
-            valid = valid_node & valid_cluster
-            
-            if valid.any():
-                valid_b = batch_idx[valid]
-                valid_n = n[valid]
-                valid_k = k[valid]
-                
-                assignments[valid_b, valid_n] = valid_k
-                node_assigned[valid_b, valid_n] = True
-                cluster_counts[valid_b, valid_k] += 1
-            
-            if node_assigned.all():
-                break
-
-        if not greedy:
-            chosen_probs = torch.gather(probs, 2, assignments.unsqueeze(-1)).squeeze(-1)
-
-            log_probs_total = torch.log(chosen_probs + 1e-10).sum(dim=1) # [B]
-        else:
-            log_probs_total = torch.zeros(B, device=device)
-        
-        return assignments, log_probs_total
-
     def forward(self, batch, greedy=False, pomo_starts=None):
         coords = batch['coordinates']
         B, Total, _ = coords.size()
-        N_DUMMIES = Total - self.opts.graph_size
+        
+        # 1. Calcul standardisé des Dummies
+        N_DUMMIES = int(self.opts.dummy_rate * self.opts.graph_size)
         
         clients_coords = coords[:, N_DUMMIES:, :] 
         clients_demand = batch['demand'][:, N_DUMMIES:]
@@ -113,9 +46,7 @@ class NeuralDivider(nn.Module):
         x = torch.cat([clients_coords, d], dim=-1)
         
         h = self.encoder(self.embed(x)) 
-        
         graph_context = h.mean(dim=1) 
-        
         keys = self.project_k(h) 
 
         B, N, _ = h.size()
@@ -133,19 +64,15 @@ class NeuralDivider(nn.Module):
                 start_node_idx = pomo_starts[:, k]
 
                 last_nodes.append(h[torch.arange(B), start_node_idx])
-                
                 assignments[torch.arange(B), start_node_idx] = k
                 visited_mask[torch.arange(B), start_node_idx] = True
 
             steps_to_do = target_size - 1
         else:
-            #sans pomo
             last_nodes = [self.cluster_queries[k].unsqueeze(0).expand(B, -1) for k in range(K)]
             steps_to_do = target_size
 
         for step in range(steps_to_do):
-            
-            #Round robin
             turn_order = torch.randperm(K, device=h.device)
             
             for i in range(K):
@@ -159,7 +86,11 @@ class NeuralDivider(nn.Module):
 
                 scores = torch.bmm(query, keys.transpose(1, 2)).squeeze(1) / (self.hidden_dim ** 0.5)
 
-                scores[visited_mask] = -float('inf')
+                T = 1.0 if greedy else self.opts.temperature
+                scores = scores / T
+
+                # --- FIX AUTOGRAD (Contre le crash in-place) ---
+                scores = scores.masked_fill(visited_mask, float('-inf'))
 
                 probs = F.softmax(scores, dim=1)
                 dist = Categorical(probs)
@@ -171,6 +102,7 @@ class NeuralDivider(nn.Module):
                     log_probs_total += dist.log_prob(selected)
 
                 assignments.scatter_(1, selected.unsqueeze(1), k)
+                
                 visited_mask = visited_mask.clone()
                 visited_mask.scatter_(1, selected.unsqueeze(1), True)
 
@@ -205,7 +137,7 @@ class NeuralDivider(nn.Module):
         device = batch['coordinates'].device
         B = batch['coordinates'].size(0)
         
-        N_DUMMIES = self.opts.dummy_rate * self.opts.graph_size
+        N_DUMMIES = int(self.opts.dummy_rate * self.opts.graph_size)
         N_CLIENTS = self.opts.graph_size
         K = self.n_splits
         
